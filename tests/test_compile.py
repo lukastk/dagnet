@@ -565,3 +565,61 @@ def test_build_job_rejects_an_unknown_run_name(project):
             [str(p) for p in written.runs_paths],
             run_name="nope",
         )
+
+
+# --- selection -------------------------------------------------------------
+
+
+def test_select_pulls_a_key_and_everything_upstream_of_it(project):
+    """DESIGN §8: `--select "+key"` is netrun's `run_to_targets`, natively."""
+    written = project(
+        """
+        [nodes.extract]
+        fn = "MOD.extract"
+        outputs = ["rows"]
+
+        [nodes.transform]
+        fn = "MOD.transform"
+        inputs = { rows = "extract.rows" }
+        outputs = ["clean", "rejected"]
+
+        [nodes.summarise]
+        fn = "MOD.summarise"
+        inputs = { values = "transform.clean" }
+        outputs = ["summary"]
+        """,
+        module="""
+        def extract(ctx):
+            return {"rows": [1, -2, 3]}
+
+        def transform(ctx, rows):
+            return {"clean": [r for r in rows if r > 0], "rejected": [r for r in rows if r <= 0]}
+
+        def summarise(ctx, values):
+            return {"summary": sum(values)}
+        """,
+    )
+    result = materialize(written, select="+transform/clean")
+    assert result.success, result
+    # `summarise` is downstream, so it does not run; `transform/rejected` is a
+    # sibling output of a node that is atomic, so the node runs but only the
+    # selected output is recorded.
+    assert keys(result) == ["extract/rows", "transform/clean"]
+
+
+def test_selecting_a_single_leaf_runs_only_its_chain(project):
+    written = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["out"]
+
+        [nodes.b]
+        fn = "MOD.a"
+        outputs = ["out"]
+        """,
+        module="def a(ctx):\n    return {'out': 1}\n",
+    )
+    result = materialize(written, select="a/out")
+    assert result.success, result
+    assert keys(result) == ["a/out"]

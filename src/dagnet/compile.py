@@ -144,11 +144,15 @@ def _compile_node(
     for output in node.outputs:
         key = dg.AssetKey(list(asset_key(manifest, node_name, output)))
         bound = node.artifacts.get(output)
+        # `is_required=False` is what lets `can_subset=True` work: an unselected
+        # output is simply not yielded. It is not a licence for a node to skip an
+        # output it was asked for — `_unpack_return` still demands every one.
         if bound is None:
-            outs[output] = dg.AssetOut(key=key)
+            outs[output] = dg.AssetOut(key=key, is_required=False)
         else:
             outs[output] = dg.AssetOut(
                 key=key,
+                is_required=False,
                 # The node writes the artifact itself, so nothing crosses the IO
                 # manager; the asset is still materialized (see module docstring).
                 dagster_type=dg.Nothing,
@@ -184,9 +188,10 @@ def _compile_node(
         retry_policy=_retry_policy(node),
         config_schema=_config_schema(manifest, node_name) or None,
         required_resource_keys={RESOURCE_KEY},
-        # A node always computes all of its outputs, so selecting one output pulls
-        # the whole node rather than half-running it.
-        can_subset=False,
+        # Selecting one output of a multi-output node must not be an error, so the
+        # node advertises subsetting: it still runs whole (a node is atomic), and
+        # the body yields only the outputs Dagster asked for.
+        can_subset=True,
     )(compute)
 
 
@@ -220,7 +225,13 @@ def _compile_body(
             returned = asyncio.run(returned)
 
         values = _unpack_return(node_name, returned, value_outputs)
+        # A node is atomic — it always computes everything — but `--select` may
+        # have asked for only some of its outputs, and Dagster requires that only
+        # the selected ones are yielded.
+        selected = context.op_execution_context.selected_output_names
         for output in node.outputs:
+            if output not in selected:
+                continue
             bound = artifact_outputs.get(output)
             if bound is None:
                 yield dg.Output(values[output], output)

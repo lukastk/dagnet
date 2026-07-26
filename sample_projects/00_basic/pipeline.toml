@@ -1,0 +1,22 @@
+[pipeline]
+name = "basic"
+description = "A linear three-node pipeline passing values in memory."
+
+[nodes.extract]
+fn = "basic_pipeline.nodes.extract"
+description = "Produce the raw readings."
+outputs = ["readings"]
+
+[nodes.transform]
+fn = "basic_pipeline.nodes.transform"
+description = "Split the readings into the ones we keep and the ones we drop."
+inputs = { readings = "extract.readings" }
+outputs = ["clean", "rejected"]
+
+[nodes.summarise]
+fn = "basic_pipeline.nodes.summarise"
+description = "Reduce the kept readings to a single summary."
+# The parameter is called `values`, the upstream output `clean` — an input
+# reference renames as it wires.
+inputs = { values = "transform.clean" }
+outputs = ["summary"]
