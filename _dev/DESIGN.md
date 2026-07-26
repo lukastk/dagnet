@@ -116,9 +116,12 @@ Format: **TOML or JSON** — one schema, loaded from either (msgspec parses both
 name = "ai_index"
 description = "Match job ads to O*NET occupations and compute AI exposure."
 dagster_home = ".dagster"    # optional; where Dagster keeps instance state
+store_root = "."             # optional; where file artifacts resolve
 ```
 
 `dagster_home` (optional) sets where Dagster keeps its instance state (the SQLite run-history DB, event logs, concurrency-pool bookkeeping). The path is resolved **relative to the manifest file** (absolute paths allowed), defaulting to `.dagster/` next to the manifest. A `--dagster-home` CLI flag overrides it per invocation.
+
+`store_root` (optional) is **the store root** that §5.4's file-artifact paths are relative to. Same resolution rule — relative to the manifest file, absolute allowed — defaulting to `.`, i.e. the manifest's own directory. Precedence: `--store-root` CLI flag > this field > the default. *(Decided 2026-07-27: the map should carry its own store location rather than it existing only as a CLI flag, symmetric with `dagster_home`.)*
 
 ### 5.2 `[pools]` — named concurrency limits
 
@@ -148,12 +151,24 @@ Every variable a node may read via `ctx.vars` must be declared here (global) or 
 kind = "file"
 path = "extracted/openfda_drug_ndc.json"     # relative to the store root
 
+[artifacts."db/warehouse"]
+kind = "file"
+path = "warehouse.duckdb"
+
 [artifacts."db/drugs"]
 kind = "duckdb_table"
 table = "drugs"
+database = "db/warehouse"    # required; names a declared file artifact
 ```
 
 An artifact is a durable thing with a *declared location*. This section replaces Scuttlebug's `paths.py`: locations are stated once, in the map, and both the producing node and any consuming node resolve them through the manifest. Artifact keys become Dagster asset keys, so the UI shows them with their materialization history. AISI-style pipelines can omit this section entirely.
+
+`kind = "duckdb_table"` carries a **required** `database` field naming a declared `file`-kind artifact. `dagnet check` verifies the reference resolves and that its target really is a file. *(Decided 2026-07-27: without it, the database's location lives outside the manifest — which is the `paths.py` problem this section exists to fix, in miniature.)* Consequently `ctx.artifact(key)` returns:
+
+- a `Path` for a `file` artifact — resolved under `store_root` (§5.1);
+- a frozen handle with `.table: str` and `.database: Path` for a `duckdb_table` artifact.
+
+The handle is frozen because a node resolving a location must not be able to move it.
 
 ### 5.5 `[nodes.*]` — the nodes
 
@@ -194,9 +209,17 @@ Field-by-field:
 - **`inputs`** — a table mapping *this function's parameter name* → a reference. A reference is either `<node>.<output>` (the value of another node's output, passed via IO manager) or an artifact key (the consuming function receives the resolved location — a `Path` for files, a table name for DuckDB tables). References must resolve to exactly one producer; ambiguity or no-producer is a check error. **There is no separate edges list** — an edge *is* an input referencing an output, so the redundancy that let Scuttlebug's 43 edges go contentless cannot exist.
 - **`outputs`** — the node's named outputs. Declared here (in the file, authoritative), validated against the function's return annotation when one is present. Each output becomes a Dagster asset (key `node/output` by default, or the bound artifact key). The duplication between the manifest and the function signature is deliberate: the file must show every node's full interface without reading any Python, and `dagnet check` keeps the two in lockstep (§7b). Ports are never derived from code.
 - **`artifacts`** — optional table mapping an output name → an artifact key from §5.4, meaning "this output is that durable artifact; the node writes it itself" (see contract, §7).
-- **`after`** — list of node names: pure ordering, no data. Compiles to non-argument deps. Replaces the entire signal/control/broadcast apparatus (9 of AISI's 21 edges plus 2 factory nodes collapse into this one field).
+- **`after`** — list of node names: pure ordering, no data. Compiles to non-argument deps. Replaces the entire signal/control/broadcast apparatus (9 of AISI's 21 edges plus 2 factory nodes collapse into this one field). Use it when B genuinely must follow A. When two nodes are merely *mutually exclusive* — both write the same DuckDB file, say — with no reason for either to go first, the right tool is a `pool` of 1 (§5.2), not an invented ordering. Asserting an order the pipeline does not have is how netrun graphs drifted into carrying edges whose only payload was `"done"`.
 - **`asset`** — boolean, default `true`. When `false`, the node's outputs are *transient*: they compile to Dagster ops with no asset identity — no catalog entry, no materialization history, no `checks`, not `--select`-able. Use it for very small nodes producing intermediates that nothing needs to resume from or validate. The compiler folds each op-node into the graph backing the nearest downstream asset node(s) (Dagster's "graph-backed assets") — that nesting is compile-time packaging, invisible here: the manifest stays a flat graph. Two consequences: an op-node must reach an asset node downstream via `inputs` (a transient chain nothing durable consumes is dead code → check error), and an op-node feeding *two* asset nodes merges them into one multi-asset that always materializes together (check-time warning).
-- **`pool`**, **`retries`**, **`description`**, **`group`** (optional UI grouping, e.g. `extract`/`transform`/`load`), **`checks`** (output name → list of check-function import paths, compiled to Dagster asset checks).
+- **`pool`**, **`retries`**, **`description`**, **`group`** (optional UI grouping, e.g. `extract`/`transform`/`load`).
+- **`checks`** — output name → list of check declarations, compiled to Dagster asset checks. Each entry is either a bare import path or the long form `{ fn = "...", blocking = false }`. **Checks block by default**: a failing blocking check stops the assets downstream of it and fails the run with a nonzero exit. `blocking = false` makes a check *advisory* — still executed, still recorded and visible in the UI (at WARN severity), but the run continues. *(Decided 2026-07-27: exiting 0 on a violated schema contract is precisely the silent failure this design's loud-errors principle forbids; advisory exists for things worth seeing that are not contract breaches.)*
+
+  ```toml
+  checks = { measurements = [
+      "pkg.checks.units_are_canonical",                             # blocking
+      { fn = "pkg.checks.row_count_is_usual", blocking = false },   # advisory
+  ] }
+  ```
 
 ### 5.6 What deliberately has no place in the manifest
 
@@ -226,6 +249,19 @@ llm_model = "gemma-27b"
 
 Rules, explicitly: `[defaults]` merged with `[runs.<name>]` (run wins); scalar keys set global variables; subtable keys must name a node and set that node's variables. Every key must match a declared variable (§5.3/§5.5) — unknown keys are check errors, not silently ignored. The merged result compiles to Dagster run config, so it is also visible/editable in the Dagster UI's launchpad when launching from there.
 
+**Full precedence**, once node-local declarations and per-node overrides are all in play — highest first *(decided 2026-07-27)*:
+
+1. the run's per-node override — `[runs.<run>.<node>]`
+2. `[defaults]`' per-node override — `[defaults.<node>]`
+3. the run's global value — `[runs.<run>]`
+4. `[defaults]`' global value — `[defaults]`
+5. the node-local declared default — `[nodes.<node>.vars]`
+6. the global declared default — `[vars]`
+
+That is: values set by a run always beat declared defaults; among values, more specific beats less specific and the run beats the defaults section; among declared defaults, node-local beats global (§5.3).
+
+**Variable types are scalars only** for now — `str`, `int`, `float`, `bool`. Widen to typed lists (`list[str]`, `list[int]`) when a real consumer forces it, deliberately rather than preemptively *(decided 2026-07-27)*.
+
 Run defs can also be a **folder**: point the wrapper at a `runs/` directory and every `*.toml`/`*.json` file in it is loaded and merged into one run registry (a duplicate run name across files is a loud check error). The underlying API is `load_runs(path)`, callable repeatedly and accumulating — the folder form is just a loop over it, and a consumer can load several sources (e.g. a checked-in `runs/` plus a local scratch file).
 
 ---
@@ -249,6 +285,14 @@ Explicit rules:
 3. **`ctx`** is a small wrapper-owned object (not Dagster's context — nodes stay framework-agnostic): `ctx.vars` (resolved variables: globals + this node's overrides), `ctx.artifact(key)` (resolved location of any declared artifact), `ctx.run_name`.
 4. **Printing/logging.** netrun injected a special `print`; that's gone. Use normal `print` — Dagster captures stdout/stderr per step into the run's logs, viewable in the UI.
 5. **nblite is untouched.** `fn` points at the exported function in `src/`; whether it was authored as a `.pct.py` notebook is invisible to the wrapper.
+6. **Check functions** (§5.5) follow the same shape *(decided 2026-07-27)*:
+
+   ```python
+   def units_are_canonical(ctx, measurements):
+       return {"passed": bool(...), "metadata": {...}}    # or just a bool
+   ```
+
+   `ctx` first, then the **subject**: the asset's loaded value for a normal output, or the resolved artifact location for an artifact-bound one (there is no value to load). Returning a bool or a `{"passed": bool, "metadata": {...}}` dict are the only accepted shapes — anything else raises `CheckReturnError`. Raising from the check counts as a failure. Check functions import no framework either.
 
 ## 7b. Validation (`dagnet check`) — the loud-errors inheritance
 
@@ -260,7 +304,13 @@ The one piece of netrun's rewrite-identity kept beyond the file itself: **aggreg
 - `pool` names exist in `[pools]`; check/`fn` import paths exist; artifact keys are unique; artifact-bound outputs exist on their node;
 - every `asset = false` node reaches a downstream asset node through `inputs` references (transient work that no durable output consumes is dead code); an op-node shared by two asset nodes triggers the merge warning (§5.5);
 - runs files: every run key matches a declared variable / node; types match declarations; no duplicate run names across files;
-- when both sides carry type annotations, wired output↔input annotations are compared (equal-or-warn — cheap static type compatibility Dagster itself doesn't do until runtime).
+- when both sides carry type annotations, wired output↔input annotations are compared (equal-or-warn — cheap static type compatibility Dagster itself doesn't do until runtime);
+- a `duckdb_table` artifact's `database` resolves to a declared artifact, and that artifact is a file (§5.4);
+- node, output, artifact-key-component and run names are plain identifiers (`[A-Za-z0-9_]+`), since they become Dagster op/output/job names — better as our located diagnostic than as a Dagster traceback;
+- every node declares at least one output. A node with none cannot compile to a multi-asset. *(If a real pipeline surfaces a genuine pure-side-effect terminal node, that is a design question to reopen — not a reason to invent a token output, which is the netrun `"done"` disease returning.)*
+- a run preset that leaves a declared no-default variable unset is reported **at check time**, per run, as well as being a launch error (§5.3).
+
+All decided 2026-07-27.
 
 Dagster's own definition-time validation (which runs when we build `Definitions`) remains as a backstop, but `dagnet check` should catch everything first, in our vocabulary, with our locations.
 
@@ -284,9 +334,16 @@ Dagster's own definition-time validation (which runs when we build `Definitions`
 
 Execution surfaces, explicitly:
 
-- **`dagnet run <run_name> [--select expr]`** — resolves the run preset, builds `Definitions`, calls `materialize(...)` in-process (or with the multiprocess executor via a job — default: multiprocess, since both consumers want parallel steps and process isolation). `--select` passes through Dagster's asset-selection syntax, which is the pull model: e.g. `--select "+db/drugs"` = "materialize `db/drugs` and everything upstream of it" (netrun's `run_to_targets`, natively). A `--ephemeral` flag runs with no instance state at all — Dagster's native default when no `DAGSTER_HOME` is set — leaving no history behind (for CI); caveat: pool limits may not be enforced in that mode (spike item (a)).
+- **`dagnet run <run_name> [--select expr]`** — resolves the run preset, builds `Definitions`, calls `materialize(...)` in-process (or with the multiprocess executor via a job — default: multiprocess, since both consumers want parallel steps and process isolation). `--select` passes through Dagster's asset-selection syntax, which is the pull model: e.g. `--select "+db/drugs"` = "materialize `db/drugs` and everything upstream of it" (netrun's `run_to_targets`, natively). A `--ephemeral` flag runs with no instance state at all — Dagster's native default when no `DAGSTER_HOME` is set — leaving no history behind (for CI). **Spike (a) found this is stronger than a caveat:** an ephemeral instance cannot use the multiprocess executor at all (Dagster raises `DagsterUnmetExecutorRequirementsError`) and reports `supports_global_concurrency_limits = False`. So `--ephemeral` implies **in-process** execution, and `[pools]` limits are inert in that mode. dagnet prints a warning naming them; it is deliberately **not** an error, since the mode is an explicit opt-in and erroring would make it unusable for any pooled pipeline *(decided 2026-07-27)*.
+
+Pool *limits* are instance state, not definition state: `pool = "heavy"` on a node is only a tag, so `dagnet run`/`dagnet dev` write `[pools]` onto the instance on every invocation (`set_concurrency_slots`), with `concurrency.pools.granularity: op` so limits apply per step rather than per run. Without that sync, editing a limit in the manifest would silently do nothing.
 - **`dagnet dev`** — wraps `dagster dev` pointed at the generated `defs.py`, with `DAGSTER_HOME` set per the manifest's `dagster_home` field (default: `.dagster/` next to the manifest file — §5.1). This is where run history, log browsing, the launchpad, and **re-execution from failure** live — the latter replacing `skip_if_done` / `resume_on_quota.sh` / `from_raw.py` entirely.
+- **`dagnet run <run_name> --from-failure <run_id|last>`** — resume a failed run, skipping the steps that already succeeded. Spike (e) confirmed this works from library mode and reaches individual ops inside graph-backed assets, so it is what replaces Scuttlebug's hand-rolled `skip_if_done` *(added 2026-07-27; §8 previously put re-execution only in `dagnet dev`)*.
 - **`dagnet graph`** — Mermaid export from the manifest (no Dagster needed), for READMEs.
+
+The run-preset name is **optional**: `dagnet run` with no preset uses the declared defaults, so a project with no runs file works. `ctx.run_name` is `""` in that case *(decided 2026-07-27)*.
+
+Multiprocess execution needs one piece of plumbing DESIGN did not anticipate: `materialize(...)` and `execute_in_process(...)` always run in-process whatever executor a job names, so real multiprocess requires `execute_job` with a *reconstructable* job. Since dagnet's job is built at runtime from a manifest path, a module-level reconstructor entry point (`dagnet/_reconstruct.py`) rebuilds it in each step subprocess from JSON-serializable arguments (spike (b)).
 
 ---
 
@@ -311,7 +368,8 @@ Home: its own small repo/box from the start (it has two target consumers immedia
 ## 11. Build plan
 
 1. **v0 of the package** (~500–800 lines): manifest + runs schema (msgspec), `check` with aggregated diagnostics, the compiler to `Definitions` (staged internally: the all-assets path first, then the `asset = false` partitioner), `run`/`dev`/`graph` CLI incl. `--ephemeral`. Includes the **spike-verify items**: (a) concurrency-pool enforcement under `dagnet run` (library mode / local instance — may need `DAGSTER_HOME` even for CLI runs); (b) async node functions under the multiprocess executor; (c) value passing of numpy arrays / DataFrames via the default pickle IO manager at AISI scale; (d) `AssetIn`-style renaming ergonomics; (e) re-execution-from-failure granularity for ops inside graph-backed assets.
-2. **Port AISI** (the faithful consumer, no rearchitecting needed): generate `pipeline.toml` mechanically from its `netrun.json` (18 nodes; signal/control/broadcast edges → `after`), copy `run_defs.toml` nearly verbatim, drop the `print` parameter from node signatures, delete the 136-line runner. Validate with its `test_api` / `test_local` runs.
+   **Done 2026-07-27.** All five spike items verified before anything was built on them (`_dev/experiments/FINDINGS.md`); nine sample projects run end to end.
+2. ~~**Port AISI**~~ — **dropped 2026-07-27.** The real port would have cost model downloads, HPC access and API keys for validation that is fundamentally *structural*. Replaced by `sample_projects/09_ai_index`: a topologically faithful, stub-bodied replica derived from the public `config/netrun.json` and `config/run_defs.toml` — the same 18 nodes, the same port renames, the signal/control/broadcast edges collapsed into `after`, the join node as a plain multi-input node, `heavy = 1`, retries, and the real run-preset structure with dummy URLs and model names. It keeps the "every feature composed in one realistic pipeline" validation and none of the weight.
 3. **Port Scuttlebug** per its own pad's migration plan, with the wrapper as the declarative layer: the coupling audit's producer→consumer map becomes `inputs`/`artifacts` (this exercises the artifact half of the schema and replaces `paths.py`); add checks for the PND/umol class; full from-raw build; `check_reconcile.py` D1–D10 as the oracle.
 4. **Then**: extract a `Component` shim for `defs.yaml`/`dg` interop if wanted; write the agent-facing skill/doc (small — the manifest schema + this pad's contract section is most of it); decide the netrun repo's fate.
 
@@ -324,3 +382,23 @@ Home: its own small repo/box from the start (it has two target consumers immedia
 - [P] Scuttlebug sequencing: **build the wrapper first, then port Scuttlebug onto it** — decided 2026-07-26 (supersedes the plain-Dagster-first option mentioned in the Scuttlebug pad).
 - [P] Dagster state location: `dagster_home` in `[pipeline]`, resolved **relative to the manifest file**, default `.dagster/` next to it — decided 2026-07-26 (§5.1).
 - [P] Ephemeral CI mode: **include `--ephemeral`** — decided 2026-07-26. Trivial: a stateless in-memory instance is Dagster's native default when no `DAGSTER_HOME` is set. Caveat: pool limits may not be enforced in that mode (spike item (a)).
+
+### Decided 2026-07-27, after building v0
+
+Raised in `_dev/OPEN_QUESTIONS.md` while implementing §11 step 1; each is now folded into the section above that owns it.
+
+- [P] **Store root**: `[pipeline] store_root`, resolved relative to the manifest, default `"."`; `--store-root` overrides (§5.1).
+- [P] **DuckDB database in the schema**: `duckdb_table` gains a required `database` naming a declared file artifact; `ctx.artifact()` returns a frozen `.table`/`.database` handle (§5.4).
+- [P] **Checks block by default**: a failing check fails the run; `{ fn = "...", blocking = false }` opts out to advisory (§5.5).
+- [P] **Check-function contract**: `(ctx, subject) -> bool | {"passed", "metadata"}` (§7 rule 6).
+- [P] **Variable precedence**: the six-level order in §6.
+- [P] **`--ephemeral` + pools**: warn, do not error (§8).
+- [P] **Six v0 additions accepted**: optional run name, `--from-failure`, check-time `unfilled-var`, duplicate-`[defaults]`-key error, at-least-one-output, identifier-only names (§7b, §8).
+- [P] **Variables stay scalar** until a real consumer forces typed lists (§6).
+- [P] **Diagnostic locations** stay dotted logical paths (`pipeline.toml:nodes.rerank.inputs.ad_ids`); the `line` field stays dormant. Neither `tomllib`/`msgspec` nor `json` reports source positions, so real line numbers need a separate position-aware parse.
+- [P] **Dict-shaped return annotation kept as-is**, and kept optional (§7 rule 2). It puts string literals in annotation position, which type-aware linters read as forward references to types (33 × ruff `F821` across the sample corpus); the answer is a documented per-file ignore, or omitting the annotation, not a new form.
+- [P] **Size**: v0 is ~1,635 lines of code against the §1 estimate of 500–800, concentrated in `check.py` (the diagnostic quality *is* the product) and `compile.py`. Accepted; `compile.py` crossing ~1k lines is a checkpoint to raise.
+
+### Not being done
+
+- [D] **Porting the AISI exposure index** (§11 step 2) — dropped 2026-07-27. Its structural validation is preserved instead by `sample_projects/09_ai_index`, a topologically faithful, stub-bodied replica derived from the public `config/netrun.json`, which exercises every dagnet feature at realistic scale without model downloads, HPC or API keys.

@@ -51,10 +51,9 @@ dagnet graph                          # Mermaid, for a README
 `Definitions` (both the all-assets path and the `asset = false` partitioner), and the
 `check` / `run` / `dev` / `graph` CLI. Nine sample projects run end to end.
 
-Next per `_dev/DESIGN.md` §11: port the AISI exposure index, then Scuttlebug.
-
-Design questions raised while building v0 are collected in
-[`_dev/OPEN_QUESTIONS.md`](_dev/OPEN_QUESTIONS.md); what the pre-build spikes found
+The design questions v0 raised have all been decided and folded into
+[`_dev/DESIGN.md`](_dev/DESIGN.md); the record of what was asked and answered is
+[`_dev/OPEN_QUESTIONS.md`](_dev/OPEN_QUESTIONS.md), and what the pre-build spikes found
 about Dagster's behaviour is in [`_dev/experiments/FINDINGS.md`](_dev/experiments/FINDINGS.md).
 
 ## Commands
@@ -85,6 +84,31 @@ about Dagster's behaviour is in [`_dev/experiments/FINDINGS.md`](_dev/experiment
 - `sample_projects/` — nine self-contained sample pipelines; the de-facto spec and test corpus
 - `tests/` — unit tests (`uv run pytest`)
 - `_dev/` — design docs, spike findings, open questions
+
+## Node code and type-aware linters
+
+The dict-shaped return annotation is netrun's, kept as optional, validated
+documentation (DESIGN §7 rule 2):
+
+```python
+def extract(ctx) -> {'rows': list[int]}: ...
+```
+
+It puts string literals in annotation position, and linters read a string in an
+annotation as a forward reference to a type — so each output name is reported as
+an undefined name (ruff `F821`; mypy and pyright object more loudly). Two ways
+out, both fine:
+
+- **Keep the annotation** and ignore the rule for node modules:
+
+  ```toml
+  [tool.ruff.lint.per-file-ignores]
+  "src/*/nodes.py" = ["F821"]
+  ```
+
+- **Omit it.** The annotation is optional; `dagnet check` validates it when
+  present and says nothing when absent. The manifest is the authoritative
+  interface either way.
 
 ## Development
 

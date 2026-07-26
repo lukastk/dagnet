@@ -1,168 +1,123 @@
-# Open design questions from building v0
+# Open design questions from building v0 — **all resolved**
 
-*Raised 2026-07-26 while implementing DESIGN §11 step 1. Each names what DESIGN
-settles, what it doesn't, what I did in the meantime, and what changes if the
-answer differs. Decisions should be recorded back into DESIGN.md.*
+*Raised 2026-07-26 while implementing DESIGN §11 step 1. Decided by Lukas
+2026-07-27; every decision is now recorded in `_dev/DESIGN.md`, which stays the
+authoritative document. This file is kept as the record of what was asked and
+what was answered.*
 
-Ordered by how much the answer would change.
+**Status: 11 of 11 resolved. Nothing here is open.**
 
 ---
 
-## 1. What is the "store root"? (§5.4)
+## 1. What is the "store root"? (§5.4) — **RESOLVED**
 
-§5.4's example comments that a file artifact's `path` is "relative to the store
-root", but no section defines a store root.
+§5.4 said file-artifact paths were "relative to the store root"; no section
+defined a store root. v0 resolved them relative to the manifest's directory.
 
-**What I did:** file artifacts resolve relative to **the manifest's directory**,
-consistent with how §5.1 resolves `dagster_home`. A `--store-root` flag overrides
-it per invocation (and the sample tests use it to keep output out of the repo).
+**Decision:** add an optional `[pipeline] store_root` (default `"."`), resolved
+relative to the manifest file like `dagster_home`. Precedence `--store-root` >
+manifest field > default. *Rationale: the map should carry its own store location
+rather than it existing only as a CLI flag.*
 
-**If it should be something else** — a `[pipeline].store_root` field, or
-`dagster_home`-relative — it is a one-line change in `compile_definitions`, but
-it changes where every existing consumer's files land, so it wants deciding now.
+→ Recorded in **DESIGN §5.1**. Implemented in `locations.py`; demonstrated by
+sample 03 (`store_root = "build"`).
 
-## 2. A DuckDB table artifact doesn't say which database it is in (§5.4)
+## 2. A DuckDB table artifact doesn't say which database it is in — **RESOLVED**
 
-`kind = "duckdb_table"` carries only `table`. So the *database file's* location
-lives outside the manifest — which is the `paths.py` problem §5.4 exists to fix,
-in miniature.
+`kind = "duckdb_table"` carried only `table`, so the database's location lived
+outside the manifest — the `paths.py` problem in miniature.
 
-**What I did:** sample 03 declares the database itself as a `file` artifact
-(`"db/warehouse" = { kind = "file", path = "build/warehouse.duckdb" }`) that no
-node lists as an input; nodes resolve it with `ctx.artifact("db/warehouse")`. It
-works and keeps the path in the map, but it is a convention, not a schema.
+**Decision:** `database` becomes a **required** field naming a declared
+`file`-kind artifact. `check` validates the reference resolves *and* that the
+target is a file. `ctx.artifact()` returns a `Path` for file artifacts
+(unchanged) and a small frozen handle with `.table: str` / `.database: Path` for
+table artifacts.
 
-**Options:** add `database = "<artifact key>"` (or a path) to
-`DuckDBTableArtifact`; or bless the convention and document it; or add a
-`[pipeline].duckdb` default. Anything that puts it in the schema means
-`ctx.artifact("db/customers")` could return something richer than a bare table
-name — which would change the node contract, so it is worth settling before
-Scuttlebug is ported.
+→ Recorded in **DESIGN §5.4** and §7b. New diagnostic code `database-not-a-file`.
+Sample 03 rewritten around it.
 
-## 3. Should a failing asset check fail the run?
+## 3. Should a failing asset check fail the run? — **RESOLVED**
 
-DESIGN §3 says check failures are "loud, recorded, and visible in the UI" — which
-is what happens. It does not say whether they should be fatal.
+v0 followed Dagster's default: recorded, visible, exit 0.
 
-**What I did:** Dagster's default. Sample 07's `bad` run logs
-`Asset check 'units_are_canonical' ... did not pass`, records it against the
-asset, and the run still **exits 0**.
+**Decision: checks are blocking by default** — a failure stops the assets
+downstream and fails the run with a nonzero exit. *Rationale: exit 0 on a
+violated schema contract is precisely the silent failure this project's
+principles forbid.* Per-check opt-out via the long form
+`{ fn = "...", blocking = false }`: advisory, recorded and visible at WARN
+severity, run continues.
 
-**The tension:** for CI, an exit code of 0 on a violated schema contract is close
-to the silent failure AGENTS.md tells us to avoid. Dagster supports
-`blocking=True` per check (halt downstream assets, fail the run). A manifest
-field — `checks = { rows = [...] }` gaining a blocking form, or a per-node
-`blocking = true` — would be small. This is the question I'd most like answered.
+→ Recorded in **DESIGN §5.5**. Sample 07 demonstrates both, including the
+nonzero exit (`bad` → exit 1 with `aggregate` skipped; `noisy` → exit 0).
 
-## 4. The check-function contract is undefined (§5.5, §7)
+## 4. The check-function contract was undefined — **RESOLVED**
 
-§5.5 introduces `checks` as "output name → list of check-function import paths"
-and §8 maps them to asset checks, but no section gives the function signature.
+**Decision:** accepted exactly as implemented — `(ctx, subject) -> bool |
+{"passed", "metadata"}`, raising counts as a failure, anything else raises
+`CheckReturnError`; `subject` is the loaded value, or the resolved location for
+an artifact-bound output.
 
-**What I did:**
+→ Recorded in **DESIGN §7 rule 6**.
 
-```python
-def units_are_canonical(ctx, measurements):        # ctx, then the subject
-    return {"passed": bool, "metadata": {...}}     # or just a bool
-```
+## 5. Variable precedence beyond defaults-vs-run — **RESOLVED**
 
-`subject` is the asset's loaded value for a normal output, and the **resolved
-artifact location** for an artifact-bound output (there is no value to load).
-Raising counts as a failure. Anything else returned raises `CheckReturnError`.
+**Decision:** accepted exactly as implemented — the six-level order (run-per-node
+> defaults-per-node > run-global > defaults-global > node-local declared default
+> global declared default).
 
-## 5. Variable precedence beyond defaults-vs-run (§6)
+→ Recorded in **DESIGN §6**.
 
-§6 fixes "`[defaults]` merged with `[runs.<name>]`, run wins" but not what happens
-once node-local declarations and per-node overrides are all in play.
+## 6. `--ephemeral` cannot be multiprocess at all — **RESOLVED**
 
-**What I did** (highest first, documented in `runs.py` and sample 05's README):
+**Decision:** keep the **warning**, not an error. *Rationale: the mode is an
+explicit opt-in and the warning names the inert pools; erroring would make
+ephemeral unusable for any pooled pipeline.*
 
-1. the run's per-node override — `[runs.<run>.<node>]`
-2. `[defaults]`' per-node override — `[defaults.<node>]`
-3. the run's global value — `[runs.<run>]`
-4. `[defaults]`' global value — `[defaults]`
-5. the node-local declared default — `[nodes.<node>.vars]`
-6. the global declared default — `[vars]`
+→ Recorded in **DESIGN §8**, along with the mandatory pool-limit sync onto the
+instance that spike (a) turned up.
 
-Values set by a run always beat declared defaults; among values, more specific
-wins and the run beats defaults; among declared defaults, node-local wins.
+## 7. Seven additions v0 made that DESIGN didn't mention — **ALL ACCEPTED**
 
-## 6. `--ephemeral` cannot be multiprocess at all
+Optional run name; `dagnet run --from-failure`; check-time `unfilled-var`;
+duplicate-`[defaults]`-key error; at-least-one-output; identifier-only names.
 
-Spike (a) found this is stronger than §8's caveat: Dagster raises
-`DagsterUnmetExecutorRequirementsError` for multiprocess on an ephemeral instance,
-and reports `supports_global_concurrency_limits = False`.
+**One standing instruction attached to at-least-one-output:** if a real pipeline
+surfaces a genuine pure-side-effect terminal node, **raise it** — do not quietly
+invent a token output. That is the netrun `"done"` disease coming back.
 
-**What I did:** `--ephemeral` implies the in-process executor, and prints a
-warning when the manifest declares `[pools]` saying the limits are NOT enforced.
+→ Recorded in **DESIGN §7b** and **§8**.
 
-**Question:** should that be an **error** instead? A CI run that silently ignores
-`heavy = 1` may thrash a machine. Erroring would make `--ephemeral` unusable for
-any pipeline with pools, which may be worse.
+## 8. Variable types are scalars only — **RESOLVED**
 
-## 7. Additions I made that DESIGN doesn't mention
+**Decision:** stay scalar for now. Widen to typed lists (`list[str]`, `list[int]`)
+only when a real consumer actually forces it — deliberately, not preemptively.
 
-Each is small and removable; flagging so none becomes an unnoticed default.
+→ Recorded in **DESIGN §6**.
 
-- **`dagnet run` with no run name.** §8 writes `dagnet run <run_name>`; I made it
-  optional so a project without a runs file works (samples 00–04, 08 rely on it).
-  `ctx.run_name` is `""` in that case.
-- **`dagnet run --from-failure <run_id|last>`.** §8 puts re-execution only in
-  `dagnet dev`, but spike (e) showed it works from library mode and reaches
-  individual ops. This is what replaces Scuttlebug's `skip_if_done`, so having it
-  on the CLI seemed worth more than the ~15 lines.
-- **`unfilled-var` reported at check time.** §5.3 says an unfilled non-default
-  variable is a *launch* error. Since `check` already reads the run presets, it
-  reports per-run which required variables a preset leaves unset. Still enforced
-  at launch too.
-- **A duplicate `[defaults]` key across runs files is an error**, symmetric with
-  the duplicate-run-name rule §6 does state. With several files in a folder there
-  is no defensible winner. May be too strict for the "checked-in `runs/` plus a
-  local scratch file" case §6 mentions.
-- **A node must declare at least one output** (`no-outputs`). Every example in
-  DESIGN does, and a node with none cannot compile to a multi-asset — but a
-  terminal "publish" node that only has side effects would have to declare a
-  token output.
-- **Node, output, artifact-key-component and run names must be plain identifiers**
-  (`[A-Za-z0-9_]+`), because they become Dagster op/output/job names. Better as
-  our diagnostic than as a Dagster traceback, but it is a constraint DESIGN
-  doesn't state.
+## 9. Diagnostic locations are logical paths, not line numbers — **RESOLVED**
 
-## 8. Variable types are scalars only
+**Decision:** dotted paths are enough for v0. Keep the dormant `line` field so
+adding real positions later changes no call sites.
 
-`[vars]` accepts `str`, `int`, `float`, `bool`. §6's examples are all scalar and
-§5.3 says nothing wider, so I kept it tight. Lists come up in practice (a list of
-regions, a list of model names). Widening is easy; narrowing later is not.
+→ Recorded in **DESIGN §12**.
 
-## 9. Diagnostic locations are logical paths, not line numbers
+## 10. Two consequences worth knowing about — **ACKNOWLEDGED**
 
-A `Location` renders as `pipeline.toml:nodes.rerank_candidates.inputs.ad_ids`.
-Neither `tomllib`/`msgspec` nor `json` reports source positions, so a real
-`file:line:col` needs a position-aware parse alongside the value parse.
-`Location` already carries an unpopulated `line` field, so adding it later
-changes no call sites. Is the dotted path enough for v0?
+- **A graph-backed asset does not subset** — a node folding in `asset = false`
+  op-nodes loses per-output selectability. Documented in sample 06's README.
+- **The dict-shaped return annotation trips type-aware tooling.**
+  **Decision:** keep the annotation as designed and keep it optional; document the
+  recommended per-file lint ignore (and the option of simply omitting the
+  annotation) in the README. No alternative form for now.
 
-## 10. Two consequences worth knowing about
+→ Recorded in **DESIGN §12**; the ignore is documented in the top-level README.
 
-Not questions, but things that will surprise someone eventually:
+## 11. Size — **ACCEPTED**
 
-- **A graph-backed asset does not subset.** A node that folds in `asset = false`
-  op-nodes loses per-output selectability: selecting one of its outputs pulls all
-  of them. Documented in sample 06's README. Plain asset nodes are unaffected.
-- **The dict-shaped return annotation trips type-aware tooling.** `-> {'rows': list[int]}`
-  puts string literals in annotation position, and linters read a string
-  annotation as a forward reference to a type — so every output name reads as an
-  undefined name (33 × F821 across the samples; mypy/pyright would object harder).
-  Ignored per-file in `pyproject.toml` with an explanation. Consumer repos hit
-  this too. Worth considering an alternative documented form, since §7 already
-  makes the annotation optional.
+~1,635 lines of code against the §1 estimate of 500–800.
 
-## 11. Size
+**Decision:** justified by content — `check.py`'s diagnostic quality is the
+product. **Standing checkpoint: if `compile.py` approaches ~1,000 lines, raise it
+before it gets there.** (At the time of writing it is ~830.)
 
-DESIGN §1 estimated ~500–800 lines. v0 is **~1,635 lines of code** (3,360
-including docstrings and comments) across 15 modules. The overshoot is
-concentrated in two places: `check.py` (599 lines) — the aggregated diagnostics
-with per-case messages, did-you-mean hints and locations — and `compile.py` (794)
-— which carries both the multi-asset path and the graph-backed partitioner.
-Nothing here is Dagster reimplementation; it is validation surface and the
-op/asset packaging. Flagging in case the number matters more than the content.
+→ Recorded in **DESIGN §12**.
