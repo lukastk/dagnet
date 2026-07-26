@@ -7,6 +7,11 @@ what was answered.*
 
 **Status: 11 of 11 resolved. Nothing here is open.**
 
+*Two further questions were raised on 2026-07-27 by building `sample_projects/09_ai_index`
+and decided the same day — a pipeline-wide `retries` default (DESIGN §5.1) and
+environment-sourced variable declarations (DESIGN §5.3). They are recorded in
+DESIGN §12 rather than restated here.*
+
 ---
 
 ## 1. What is the "store root"? (§5.4) — **RESOLVED**

@@ -1,6 +1,10 @@
 [pipeline]
 name = "ai_index"
 description = "AI exposure index: match job ads to O*NET occupations and score them."
+# netrun set `retries: 3, retry_wait: 10` once, at the top level, for every node.
+# A node's own `retries` replaces this entirely; nothing here and nothing on the
+# node means no retry.
+retries = { max = 3, wait_s = 10 }
 
 # netrun pools owned threads (main: 4 threads, heavy: 1). Here a pool is purely a
 # limit; parallelism comes from the Dagster executor. `heavy = 1` serializes the
@@ -16,7 +20,7 @@ heavy = 1
 # `run_name` is NOT declared: netrun needed it as a variable, dagnet provides
 # `ctx.run_name` natively.
 [vars]
-adzuna_s3_prefix = { type = "str", default = "s3://dummy-bucket/adzuna", description = "Dummy: the real one comes from the environment." }
+adzuna_s3_prefix = { type = "str", env = "ADZUNA_S3_PREFIX", default = "s3://dummy-bucket/adzuna", description = "From the environment; the default keeps this sample runnable anywhere." }
 sample_n = { type = "int" }
 sample_seed = { type = "int" }
 embedding_model = { type = "str" }
@@ -38,7 +42,6 @@ fn = "ai_index.nodes.fetch_onet"
 description = "Download and extract the O*NET database."
 outputs = ["onet_db"]
 pool = "main"
-retries = { max = 3, wait_s = 10 }
 group = "ingest"
 
 [nodes.fetch_adzuna]
@@ -46,7 +49,6 @@ fn = "ai_index.nodes.fetch_adzuna"
 description = "Pull job ads from the ad archive."
 outputs = ["ads"]
 pool = "main"
-retries = { max = 3, wait_s = 10 }
 group = "ingest"
 
 [nodes.fetch_adzuna.vars]
@@ -85,7 +87,6 @@ description = "Embed raw job ad text."
 inputs = { ad_ids = "sample_ads.ad_ids" }
 outputs = ["ad_ids"]
 pool = "heavy"
-retries = { max = 3, wait_s = 10 }
 group = "match"
 
 [nodes.embed_ads.vars]
@@ -100,7 +101,6 @@ description = "Embed O*NET occupations as single rich documents."
 after = ["prepare_onet_targets"]
 outputs = ["out"]
 pool = "main"
-retries = { max = 3, wait_s = 10 }
 group = "match"
 
 [nodes.embed_onet.vars]
@@ -127,7 +127,6 @@ description = "LLM negative selection on the cosine candidates."
 inputs = { ad_ids = "cosine_candidates.ad_ids" }
 outputs = ["successful_ad_ids"]
 pool = "main"
-retries = { max = 3, wait_s = 10 }
 group = "match"
 
 [nodes.llm_filter_candidates.vars]
@@ -146,7 +145,6 @@ description = "Cross-encoder reranking of the filtered candidates."
 inputs = { ad_ids = "llm_filter_candidates.successful_ad_ids" }
 outputs = ["ad_ids"]
 pool = "main"
-retries = { max = 3, wait_s = 10 }
 group = "match"
 
 [nodes.rerank_candidates.vars]
@@ -190,7 +188,6 @@ description = "Classify O*NET tasks by AI exposure via LLM, aggregate to occupat
 after = ["prepare_onet_targets"]
 outputs = ["out"]
 pool = "heavy"
-retries = { max = 3, wait_s = 10 }
 group = "score"
 
 [nodes.score_task_exposure.vars]
@@ -204,7 +201,6 @@ description = "Pairwise Bradley-Terry scoring of O*NET tasks by AI exposure."
 after = ["prepare_onet_targets"]
 outputs = ["out"]
 pool = "heavy"
-retries = { max = 3, wait_s = 10 }
 group = "score"
 
 [nodes.score_task_exposure_bt.vars]

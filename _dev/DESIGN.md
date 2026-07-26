@@ -117,9 +117,12 @@ name = "ai_index"
 description = "Match job ads to O*NET occupations and compute AI exposure."
 dagster_home = ".dagster"    # optional; where Dagster keeps instance state
 store_root = "."             # optional; where file artifacts resolve
+retries = { max = 3, wait_s = 10 }   # optional; the default retry policy
 ```
 
 `dagster_home` (optional) sets where Dagster keeps its instance state (the SQLite run-history DB, event logs, concurrency-pool bookkeeping). The path is resolved **relative to the manifest file** (absolute paths allowed), defaulting to `.dagster/` next to the manifest. A `--dagster-home` CLI flag overrides it per invocation.
+
+`retries` (optional) is the **pipeline-wide default retry policy**: every node inherits it. A node's own `retries` (§5.5) **replaces it entirely** — an override is the whole policy, not a field-wise merge, so reading a node's `retries` tells you what that node does without also having to read the pipeline header. Absent both here and on the node means no retry. `max` is a count of *extra* attempts, so `max = 0` and omitting `retries` are the same thing; a negative `max` or `wait_s` is a check error. *(Decided 2026-07-27: netrun set `retries: 3, retry_wait: 10` once at the top level for all 18 of AISI's nodes, and having no equivalent forced the same three lines to be repeated eight times — see `sample_projects/09_ai_index`.)*
 
 `store_root` (optional) is **the store root** that §5.4's file-artifact paths are relative to. Same resolution rule — relative to the manifest file, absolute allowed — defaulting to `.`, i.e. the manifest's own directory. Precedence: `--store-root` CLI flag > this field > the default. *(Decided 2026-07-27: the map should carry its own store location rather than it existing only as a CLI flag, symmetric with `dagster_home`.)*
 
@@ -137,12 +140,23 @@ Compiles to Dagster concurrency pools. This is netrun's `pools` *reinterpreted*:
 
 ```toml
 [vars]
-run_name  = { type = "str" }
-sample_n  = { type = "int", default = 1000 }
-llm_model = { type = "str" }
+run_name    = { type = "str" }
+sample_n    = { type = "int", default = 1000 }
+llm_model   = { type = "str" }
+s3_prefix   = { type = "str", env = "ADZUNA_S3_PREFIX" }   # sourced from the environment
 ```
 
 Every variable a node may read via `ctx.vars` must be declared here (global) or on a node (node-local, §5.5). Undeclared variable referenced in a runs file → check error. Unfilled non-default variable at launch → launch error. (netrun's `node_vars`, minus the `inherit` machinery: a node-level declaration with the same name simply overrides the value for that node.)
+
+**`env`** (optional, on any declaration) names an environment variable to take the value from. The resolution order for one variable is:
+
+> a run-supplied value  >  the named environment variable, if set  >  the declared `default`  >  **loud launch error naming both the variable and the environment variable that would satisfy it**
+
+Three reasons for putting this on the *declaration* rather than in values: the manifest must **name** the environment variable so configuration stays discoverable from the map (no orphan knowledge in someone's shell profile); the environment is the right ambient source for secrets and per-machine paths, so run presets don't hard-code machine-specific values; and an explicit run value stays the most intentional signal, so it wins. Environment values are strings, so the declared type converts them, loudly on mismatch (`bool` accepts `true/false/1/0/yes/no/on/off`, case-insensitive).
+
+A declaration with `env` and no `default` is *optional at check time* and *required at launch* — `dagnet check` must say the same thing on every machine, so it never consults the environment; the enforcement is the launch error above. Dropping the `default` is therefore how a variable becomes "must come from the environment or a run".
+
+**Value-side interpolation is deliberately excluded.** There is no `${VAR}` inside runs files or manifest values: one mechanism, on the declaration side, where it is discoverable. *(Decided 2026-07-27. If a consumer genuinely needs value-side interpolation, that is a question to reopen, not a thing to add locally.)*
 
 ### 5.4 `[artifacts]` — declared durable objects (optional section)
 
@@ -211,7 +225,8 @@ Field-by-field:
 - **`artifacts`** — optional table mapping an output name → an artifact key from §5.4, meaning "this output is that durable artifact; the node writes it itself" (see contract, §7).
 - **`after`** — list of node names: pure ordering, no data. Compiles to non-argument deps. Replaces the entire signal/control/broadcast apparatus (9 of AISI's 21 edges plus 2 factory nodes collapse into this one field). Use it when B genuinely must follow A. When two nodes are merely *mutually exclusive* — both write the same DuckDB file, say — with no reason for either to go first, the right tool is a `pool` of 1 (§5.2), not an invented ordering. Asserting an order the pipeline does not have is how netrun graphs drifted into carrying edges whose only payload was `"done"`.
 - **`asset`** — boolean, default `true`. When `false`, the node's outputs are *transient*: they compile to Dagster ops with no asset identity — no catalog entry, no materialization history, no `checks`, not `--select`-able. Use it for very small nodes producing intermediates that nothing needs to resume from or validate. The compiler folds each op-node into the graph backing the nearest downstream asset node(s) (Dagster's "graph-backed assets") — that nesting is compile-time packaging, invisible here: the manifest stays a flat graph. Two consequences: an op-node must reach an asset node downstream via `inputs` (a transient chain nothing durable consumes is dead code → check error), and an op-node feeding *two* asset nodes merges them into one multi-asset that always materializes together (check-time warning).
-- **`pool`**, **`retries`**, **`description`**, **`group`** (optional UI grouping, e.g. `extract`/`transform`/`load`).
+- **`pool`**, **`description`**, **`group`** (optional UI grouping, e.g. `extract`/`transform`/`load`).
+- **`retries`** — this node's retry policy, e.g. `{ max = 3, wait_s = 10 }`. Omitted, the node inherits `[pipeline].retries` (§5.1); given, it **replaces** that default entirely rather than merging field-by-field.
 - **`checks`** — output name → list of check declarations, compiled to Dagster asset checks. Each entry is either a bare import path or the long form `{ fn = "...", blocking = false }`. **Checks block by default**: a failing blocking check stops the assets downstream of it and fails the run with a nonzero exit. `blocking = false` makes a check *advisory* — still executed, still recorded and visible in the UI (at WARN severity), but the run continues. *(Decided 2026-07-27: exiting 0 on a violated schema contract is precisely the silent failure this design's loud-errors principle forbids; advisory exists for things worth seeing that are not contract breaches.)*
 
   ```toml
@@ -255,10 +270,13 @@ Rules, explicitly: `[defaults]` merged with `[runs.<name>]` (run wins); scalar k
 2. `[defaults]`' per-node override — `[defaults.<node>]`
 3. the run's global value — `[runs.<run>]`
 4. `[defaults]`' global value — `[defaults]`
-5. the node-local declared default — `[nodes.<node>.vars]`
-6. the global declared default — `[vars]`
+5. the environment, via the governing declaration's `env` (§5.3), when that variable is set
+6. the node-local declared default — `[nodes.<node>.vars]`
+7. the global declared default — `[vars]`
 
-That is: values set by a run always beat declared defaults; among values, more specific beats less specific and the run beats the defaults section; among declared defaults, node-local beats global (§5.3).
+That is: values set by a run always beat anything a declaration can supply; among values, more specific beats less specific and the run beats the defaults section; a declaration's environment source beats its own default, since the default is the fallback for when the environment is silent; among declarations, node-local beats global (§5.3). Levels 5 and 6/7 both come from the *governing* declaration for that node, so a node-local `env` shadows the global one.
+
+`[defaults]` applies to a run launched with **no preset name** too — a run without a preset is not a run without config.
 
 **Variable types are scalars only** for now — `str`, `int`, `float`, `bool`. Widen to typed lists (`list[str]`, `list[int]`) when a real consumer forces it, deliberately rather than preemptively *(decided 2026-07-27)*.
 
@@ -306,6 +324,8 @@ The one piece of netrun's rewrite-identity kept beyond the file itself: **aggreg
 - runs files: every run key matches a declared variable / node; types match declarations; no duplicate run names across files;
 - when both sides carry type annotations, wired output↔input annotations are compared (equal-or-warn — cheap static type compatibility Dagster itself doesn't do until runtime);
 - a `duckdb_table` artifact's `database` resolves to a declared artifact, and that artifact is a file (§5.4);
+- a variable's `env` is a usable environment-variable name, and a declared `default` matches its declared type (§5.3);
+- retry counts and delays are non-negative, on `[pipeline]` and on every node (§5.1);
 - node, output, artifact-key-component and run names are plain identifiers (`[A-Za-z0-9_]+`), since they become Dagster op/output/job names — better as our located diagnostic than as a Dagster traceback;
 - every node declares at least one output. A node with none cannot compile to a multi-asset. *(If a real pipeline surfaces a genuine pure-side-effect terminal node, that is a design question to reopen — not a reason to invent a token output, which is the netrun `"done"` disease returning.)*
 - a run preset that leaves a declared no-default variable unset is reported **at check time**, per run, as well as being a launch error (§5.3).
@@ -369,7 +389,7 @@ Home: its own small repo/box from the start (it has two target consumers immedia
 
 1. **v0 of the package** (~500–800 lines): manifest + runs schema (msgspec), `check` with aggregated diagnostics, the compiler to `Definitions` (staged internally: the all-assets path first, then the `asset = false` partitioner), `run`/`dev`/`graph` CLI incl. `--ephemeral`. Includes the **spike-verify items**: (a) concurrency-pool enforcement under `dagnet run` (library mode / local instance — may need `DAGSTER_HOME` even for CLI runs); (b) async node functions under the multiprocess executor; (c) value passing of numpy arrays / DataFrames via the default pickle IO manager at AISI scale; (d) `AssetIn`-style renaming ergonomics; (e) re-execution-from-failure granularity for ops inside graph-backed assets.
    **Done 2026-07-27.** All five spike items verified before anything was built on them (`_dev/experiments/FINDINGS.md`); nine sample projects run end to end.
-2. ~~**Port AISI**~~ — **dropped 2026-07-27.** The real port would have cost model downloads, HPC access and API keys for validation that is fundamentally *structural*. Replaced by `sample_projects/09_ai_index`: a topologically faithful, stub-bodied replica derived from the public `config/netrun.json` and `config/run_defs.toml` — the same 18 nodes, the same port renames, the signal/control/broadcast edges collapsed into `after`, the join node as a plain multi-input node, `heavy = 1`, retries, and the real run-preset structure with dummy URLs and model names. It keeps the "every feature composed in one realistic pipeline" validation and none of the weight.
+2. ~~**Port AISI**~~ — **dropped 2026-07-27.** The real port would have cost model downloads, HPC access and API keys for validation that is fundamentally *structural*. Replaced by `sample_projects/09_ai_index`: a topologically faithful, stub-bodied replica derived from the public `config/netrun.json` and `config/run_defs.toml` — the same 18 nodes, the same port renames, the signal/control/broadcast edges collapsed into `after`, the join node as a plain multi-input node, `heavy = 1`, retries, and the real run-preset structure with dummy URLs and model names. It keeps the "every feature composed in one realistic pipeline" validation and none of the weight — and it earned its keep immediately, surfacing the two schema gaps that became decisions 12 and 13 (§12).
 3. **Port Scuttlebug** per its own pad's migration plan, with the wrapper as the declarative layer: the coupling audit's producer→consumer map becomes `inputs`/`artifacts` (this exercises the artifact half of the schema and replaces `paths.py`); add checks for the PND/umol class; full from-raw build; `check_reconcile.py` D1–D10 as the oracle.
 4. **Then**: extract a `Component` shim for `defs.yaml`/`dg` interop if wanted; write the agent-facing skill/doc (small — the manifest schema + this pad's contract section is most of it); decide the netrun repo's fate.
 
@@ -398,6 +418,13 @@ Raised in `_dev/OPEN_QUESTIONS.md` while implementing §11 step 1; each is now f
 - [P] **Diagnostic locations** stay dotted logical paths (`pipeline.toml:nodes.rerank.inputs.ad_ids`); the `line` field stays dormant. Neither `tomllib`/`msgspec` nor `json` reports source positions, so real line numbers need a separate position-aware parse.
 - [P] **Dict-shaped return annotation kept as-is**, and kept optional (§7 rule 2). It puts string literals in annotation position, which type-aware linters read as forward references to types (33 × ruff `F821` across the sample corpus); the answer is a documented per-file ignore, or omitting the annotation, not a new form.
 - [P] **Size**: v0 is ~1,635 lines of code against the §1 estimate of 500–800, concentrated in `check.py` (the diagnostic quality *is* the product) and `compile.py`. Accepted; `compile.py` crossing ~1k lines is a checkpoint to raise.
+
+### Decided 2026-07-27, from what sample 09 could not express
+
+Building `sample_projects/09_ai_index` — a topologically faithful replica of the AISI pipeline — surfaced exactly two things the schema could not say. Both are now in it, completing v0's schema before any consumer port.
+
+- [P] **Global retries default**: `[pipeline] retries` (§5.1). A node's own `retries` replaces it **entirely**, with no field-wise merging — an override is the whole policy. No retries anywhere means no retry. Evidence: netrun's one top-level `retries: 3, retry_wait: 10` covered all 18 AISI nodes, and without an equivalent the replica repeated the same three lines eight times.
+- [P] **Environment-sourced variables**: an optional `env = "NAME"` on any variable declaration (§5.3), with the resolution order run value > environment > declared default > loud launch error naming both. Declaration-side only — **no** value-side `${VAR}` interpolation in runs files or manifest values. Evidence: netrun wrote `{ "$env": "ADZUNA_S3_PREFIX" }`, and dagnet's only alternative was for node code to read `os.environ` itself, which puts configuration back outside the map.
 
 ### Not being done
 

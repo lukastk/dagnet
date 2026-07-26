@@ -31,6 +31,8 @@ topology from it and compares — so a mistranscribed edge fails the build.
 | `config/run_defs.toml` + a 136-line runner script | `runs.toml` | −136 lines |
 | `run_name` as a declared variable | `ctx.run_name`, built in | −1 var |
 | `node_vars` with `inherit: true` | nothing — globals are visible to every node | −7 redeclarations |
+| top-level `retries: 3, retry_wait: 10` | `[pipeline] retries` | 1 line, 16 nodes |
+| `adzuna_s3_prefix = { value = { "$env" = ... } }` | `env = "ADZUNA_S3_PREFIX"` on the declaration | — |
 
 ## Features it exercises, all at once
 
@@ -43,9 +45,25 @@ topology from it and compares — so a mistranscribed edge fails the build.
   and takes nothing from it; `cosine_candidates` takes a real value from
   `embed_ads` and a completion handshake from `embed_onet`.
 - **A concurrency pool** — `heavy = 1` serializes the three GPU/LLM-shaped nodes.
-- **Retries** on the flaky fetch/LLM steps.
 - **Global and node-local variables**, including a per-node override of a global:
   `score_task_exposure` runs a different `llm_model` from the rest of the pipeline.
+- **A pipeline-wide retry default** — `[pipeline] retries = { max = 3, wait_s = 10 }`
+  covers all sixteen nodes, exactly as netrun's one top-level setting did. A node
+  that wanted different behaviour would write its own `retries`, which replaces the
+  default entirely rather than merging into it.
+- **An environment-sourced variable** — `adzuna_s3_prefix` declares
+  `env = "ADZUNA_S3_PREFIX"`, so the manifest *names* where the value comes from
+  instead of the knowledge living in someone's shell profile:
+
+  ```bash
+  uv run dagnet run test_local                                  # uses the default
+  ADZUNA_S3_PREFIX=s3://real/prod uv run dagnet run test_local  # uses the environment
+  ```
+
+  It keeps a `default` so this sample runs anywhere. **Dropping the default is how
+  a variable becomes required**: with only `env`, a run that neither sets it nor
+  finds the environment variable fails to launch, naming both the variable and the
+  environment variable that would satisfy it.
 - **Seven named run presets** from a 10-ad smoke test to a 5M-ad production run,
   with per-node overrides.
 - **Groups** — `ingest` / `onet` / `match` / `score` / `combine` in the UI and in
@@ -63,23 +81,23 @@ uv run dagnet graph
 uv run dagnet dev                   # every preset appears as a job
 ```
 
-## Two things the manifest could not express
+## The two gaps this sample found — both now closed
 
-Reproducing this pipeline surfaced exactly two gaps. Both are recorded rather
-than worked around:
+Reproducing the pipeline surfaced exactly two things the manifest could not
+express. Both were taken back to the design and answered, and this sample now
+uses the results:
 
-1. **No global `retries` default.** netrun's `netrun.json` sets `retries: 3,
-   retry_wait: 10` once, at the top level, covering every node. dagnet has only
-   per-node `retries`, so this manifest repeats
-   `retries = { max = 3, wait_s = 10 }` on the eight nodes that need it. A
-   `[pipeline] retries` default that nodes inherit and can override would remove
-   the repetition.
-2. **No environment-variable interpolation in `[vars]`.** netrun writes
-   `adzuna_s3_prefix = { value = { "$env" = "ADZUNA_S3_PREFIX" }, type = "str" }`.
-   dagnet has no equivalent, so this sample declares a dummy literal default.
-   Real pipelines need secrets and per-machine paths from the environment; today
-   the only route is for node code to read `os.environ` itself, which puts
-   configuration back outside the map.
+1. **No pipeline-wide `retries` default.** netrun set `retries: 3,
+   retry_wait: 10` once at the top level for every node; dagnet had only per-node
+   `retries`, so the first version of this manifest repeated the same three lines
+   eight times. Resolved by DESIGN §5.1: `[pipeline] retries` is the default and a
+   node's own `retries` replaces it entirely.
+2. **No way to name an environment variable in `[vars]`.** netrun wrote
+   `adzuna_s3_prefix = { value = { "$env" = "ADZUNA_S3_PREFIX" }, type = "str" }`;
+   dagnet's only route was for node code to read `os.environ` itself, putting
+   configuration back outside the map. Resolved by DESIGN §5.3: a declaration may
+   name an environment variable, and the resolution order is run value >
+   environment > declared default > loud launch error.
 
-Neither blocked the translation, and neither is invented scope — they are what a
-faithful reproduction ran into.
+Value-side interpolation (`${VAR}` inside a runs file) was deliberately **not**
+added — one mechanism, on the declaration side, where it stays discoverable.

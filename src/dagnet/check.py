@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from msgspec import UNSET
+
 from dagnet.diagnostics import Diagnostics, Location
 from dagnet.graph import (
     ARTIFACT_SEPARATOR,
@@ -45,7 +47,7 @@ from dagnet.nodefn import (
     describe,
     import_object,
 )
-from dagnet.runs import validate_runs
+from dagnet.runs import validate_runs, value_matches
 from dagnet.schema import DuckDBTableArtifact, FileArtifact, Manifest, as_check_decl
 
 #: The parameter every node function takes first (DESIGN §7 rule 1).
@@ -96,6 +98,8 @@ def check(
     graph = PipelineGraph.build(manifest)
 
     _check_names(manifest, registry, root, diags)
+    _check_vars(manifest, root, diags)
+    _check_retries(manifest, root, diags)
     _check_pools(manifest, root, diags)
     _check_outputs(manifest, root, diags)
     _check_artifact_bindings(manifest, graph, root, diags)
@@ -163,6 +167,62 @@ def _require_name(name: str, what: str, loc: Location, diags: Diagnostics) -> No
             f"{what} '{name}' is not usable: names must be letters, digits and underscores only",
             loc,
         )
+
+
+# --- variables and retries -------------------------------------------------
+
+#: POSIX environment variable names. Anything else is unreachable from a shell.
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_vars(manifest: Manifest, root: Location, diags: Diagnostics) -> None:
+    """`env` names must be usable, and a declared default must match its type."""
+    scopes = [(manifest.vars, root.child("vars"))]
+    for node_name, node in manifest.nodes.items():
+        scopes.append((node.vars, root.child("nodes", node_name, "vars")))
+
+    for declarations, scope in scopes:
+        for var, decl in declarations.items():
+            loc = scope.child(var)
+            if decl.env is not None and not _ENV_NAME.match(decl.env):
+                diags.error(
+                    "invalid-env-name",
+                    f"variable '{var}' names environment variable '{decl.env}', which is "
+                    f"not a usable name",
+                    loc.child("env"),
+                    hint="letters, digits and underscores, not starting with a digit",
+                )
+            if decl.default is not UNSET and not value_matches(decl.default, decl.type):
+                diags.error(
+                    "var-type-mismatch",
+                    f"variable '{var}' is declared as {decl.type} but its default is "
+                    f"{type(decl.default).__name__} ({decl.default!r})",
+                    loc.child("default"),
+                )
+
+
+def _check_retries(manifest: Manifest, root: Location, diags: Diagnostics) -> None:
+    """A retry count is a number of *extra* attempts, so it cannot be negative."""
+    policies = [(manifest.pipeline.retries, root.child("pipeline", "retries"))]
+    for node_name, node in manifest.nodes.items():
+        policies.append((node.retries, root.child("nodes", node_name, "retries")))
+
+    for retries, loc in policies:
+        if retries is None:
+            continue
+        if retries.max < 0:
+            diags.error(
+                "invalid-retries",
+                f"`max = {retries.max}` is not a number of retries",
+                loc.child("max"),
+                hint="0 means never retry; omit `retries` entirely for the same effect",
+            )
+        if retries.wait_s < 0:
+            diags.error(
+                "invalid-retries",
+                f"`wait_s = {retries.wait_s}` is not a delay",
+                loc.child("wait_s"),
+            )
 
 
 # --- pools ----------------------------------------------------------------

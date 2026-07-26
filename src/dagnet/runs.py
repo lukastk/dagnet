@@ -9,25 +9,44 @@ first:
 2. `[defaults]`' per-node override  `[defaults.<node>] v = ...`
 3. the run's global value           `[runs.<run>] v = ...`
 4. `[defaults]`' global value       `[defaults] v = ...`
-5. the node-local declared default  `[nodes.<node>.vars] v = { default = ... }`
-6. the global declared default      `[vars] v = { default = ... }`
+5. the environment                  `v = { env = "NAME" }`, when NAME is set
+6. the node-local declared default  `[nodes.<node>.vars] v = { default = ... }`
+7. the global declared default      `[vars] v = { default = ... }`
 
-That is: values set by a run always beat declared defaults; among values, more
-specific beats less specific and the run beats the defaults section; among
-declared defaults, node-local beats global (DESIGN §5.3: "a node-level
-declaration with the same name simply overrides the value for that node").
+That is: values set by a run always beat everything a declaration can supply;
+among values, more specific beats less specific and the run beats the defaults
+section; a declaration's environment source beats its own default (the default is
+the fallback for when the environment is silent); among declarations, node-local
+beats global (DESIGN §5.3: "a node-level declaration with the same name simply
+overrides the value for that node").
+
+Levels 5 and 7 both come from the *governing* declaration for that node, so a
+node-local declaration's `env` shadows the global declaration's.
 """
 
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass
+from typing import Mapping
 
-from msgspec import UNSET
+from msgspec import UNSET, UnsetType
 
-from dagnet.diagnostics import Diagnostics, Location
+from dagnet.diagnostics import DagnetError, Diagnostics, Location
 from dagnet.loader import RunRegistry
 from dagnet.schema import Manifest, Scalar, VarDecl, split_run_body
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+class BadEnvironmentValue(DagnetError):
+    """An environment variable held something the declared type can't accept."""
+
+
+class UnresolvedVariable(DagnetError):
+    """A variable nothing supplied: not the run, not the environment, no default."""
 
 
 @dataclass(frozen=True)
@@ -50,19 +69,43 @@ def declaration_for(manifest: Manifest, node_name: str | None, var: str) -> VarD
     return manifest.vars.get(var)
 
 
-def resolve_run(manifest: Manifest, registry: RunRegistry, name: str) -> ResolvedRun:
-    """Merge declarations, `[defaults]` and one run preset into per-node variables.
+def _declared_value(decl: VarDecl, env: Mapping[str, str], var: str) -> Scalar | UnsetType:
+    """What a declaration alone can supply: the environment, then the default.
 
-    Assumes `check` has already passed: unknown names and type mismatches are
-    diagnostics, not exceptions, and are not re-reported here.
+    An `env`-sourced value beats the declared default (the default is the
+    fallback for when the environment is silent), and both lose to anything a run
+    preset sets.
     """
+    if decl.env is not None and decl.env in env:
+        return coerce_env_value(env[decl.env], decl, var)
+    return decl.default
+
+
+def resolve_run(
+    manifest: Manifest,
+    registry: RunRegistry,
+    name: str,
+    env: Mapping[str, str] | None = None,
+) -> ResolvedRun:
+    """Merge declarations, the environment, `[defaults]` and one run preset.
+
+    Assumes `check` has already passed: unknown names and type mismatches in the
+    *runs files* are diagnostics, not exceptions, and are not re-reported here. A
+    malformed **environment** value does raise, since nothing earlier could have
+    seen it.
+
+    `env` defaults to the real process environment; tests and `check` pass their
+    own so resolution stays deterministic.
+    """
+    env = os.environ if env is None else env
     default_globals, default_nodes = split_run_body(registry.defaults)
     run_globals, run_nodes = split_run_body(registry.runs.get(name, {}))
 
     globals_: dict[str, Scalar] = {}
     for var, decl in manifest.vars.items():
-        if decl.default is not UNSET:
-            globals_[var] = decl.default
+        value = _declared_value(decl, env, var)
+        if value is not UNSET:
+            globals_[var] = value
     globals_.update(default_globals)
     globals_.update(run_globals)
 
@@ -72,9 +115,12 @@ def resolve_run(manifest: Manifest, registry: RunRegistry, name: str) -> Resolve
         for var, decl in node.vars.items():
             # A node-local declaration shadows the global *declaration*, but not a
             # value a run actually set — hence only applying it where the global
-            # contribution was itself just a declared default.
-            if decl.default is not UNSET and var not in default_globals and var not in run_globals:
-                values[var] = decl.default
+            # contribution was itself just a declaration.
+            if var in default_globals or var in run_globals:
+                continue
+            value = _declared_value(decl, env, var)
+            if value is not UNSET:
+                values[var] = value
         values.update(default_nodes.get(node_name, {}))
         values.update(run_nodes.get(node_name, {}))
         per_node[node_name] = values
@@ -82,20 +128,58 @@ def resolve_run(manifest: Manifest, registry: RunRegistry, name: str) -> Resolve
     return ResolvedRun(name=name, globals=globals_, per_node=per_node)
 
 
-def unfilled_variables(manifest: Manifest, resolved: ResolvedRun) -> list[tuple[str | None, str]]:
-    """Declared variables with no default that the run never set.
+@dataclass(frozen=True)
+class MissingVariable:
+    """A variable nothing could supply. `node` is None for a global declaration."""
 
-    Returns `(node_name_or_None, var_name)` — None meaning a global declaration.
-    """
-    missing: list[tuple[str | None, str]] = []
+    node: str | None
+    var: str
+    env: str | None
+
+    def describe(self) -> str:
+        where = f"node '{self.node}'" if self.node else "the pipeline"
+        out = f"variable '{self.var}' of {where} has no value"
+        if self.env is not None:
+            out += f"; set it in the run preset, or export {self.env}"
+        else:
+            out += "; set it in the run preset"
+        return out
+
+
+def unfilled_variables(manifest: Manifest, resolved: ResolvedRun) -> list[MissingVariable]:
+    """Declared variables that neither a run, the environment, nor a default filled."""
+    missing: list[MissingVariable] = []
     for var, decl in manifest.vars.items():
-        if decl.default is UNSET and var not in resolved.globals:
-            missing.append((None, var))
+        if var not in resolved.globals:
+            missing.append(MissingVariable(None, var, decl.env))
     for node_name, node in manifest.nodes.items():
         for var, decl in node.vars.items():
-            if decl.default is UNSET and var not in resolved.per_node[node_name]:
-                missing.append((node_name, var))
+            if var not in resolved.per_node[node_name]:
+                missing.append(MissingVariable(node_name, var, decl.env))
     return missing
+
+
+def coerce_env_value(raw: str, decl: VarDecl, var: str) -> Scalar:
+    """Environment variables are strings; the declared type says what they mean."""
+    if decl.type == "str":
+        return raw
+    if decl.type == "bool":
+        lowered = raw.strip().lower()
+        if lowered in _TRUE:
+            return True
+        if lowered in _FALSE:
+            return False
+        raise BadEnvironmentValue(
+            f"{decl.env}={raw!r} cannot be read as a bool for variable '{var}'; "
+            f"use one of {', '.join(sorted(_TRUE | _FALSE))}"
+        )
+    converter = int if decl.type == "int" else float
+    try:
+        return converter(raw.strip())
+    except ValueError:
+        raise BadEnvironmentValue(
+            f"{decl.env}={raw!r} cannot be read as {decl.type} for variable '{var}'"
+        ) from None
 
 
 def value_matches(value: Scalar, var_type: str) -> bool:
@@ -129,14 +213,21 @@ def validate_runs(manifest: Manifest, registry: RunRegistry, diags: Diagnostics)
                 _validate_value(manifest, None, key, value, loc, diags)
 
     for name in registry.runs:
-        resolved = resolve_run(manifest, registry, name)
-        for node_name, var in unfilled_variables(manifest, resolved):
-            where = f"[nodes.{node_name}.vars]" if node_name else "[vars]"
+        # Resolve against an *empty* environment: whether some machine happens to
+        # export a variable must not change what `dagnet check` says. A variable
+        # that declares `env` is therefore treated as satisfiable here, and its
+        # absence becomes a launch error instead (DESIGN §5.3).
+        resolved = resolve_run(manifest, registry, name, env={})
+        for missing in unfilled_variables(manifest, resolved):
+            if missing.env is not None:
+                continue
+            where = f"[nodes.{missing.node}.vars]" if missing.node else "[vars]"
             diags.error(
                 "unfilled-var",
-                f"run '{name}' leaves required variable '{var}' unset",
+                f"run '{name}' leaves required variable '{missing.var}' unset",
                 registry.run_sources[name],
-                hint=f"{var} is declared in {where} with no default, so every run must set it",
+                hint=f"{missing.var} is declared in {where} with no default and no "
+                f"`env`, so every run must set it",
             )
 
 

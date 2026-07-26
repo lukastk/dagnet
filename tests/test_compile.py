@@ -8,6 +8,7 @@ import pytest
 
 from dagnet.compile import CompileError, build, build_job
 from dagnet.diagnostics import CheckFailed
+from dagnet.runs import BadEnvironmentValue, UnresolvedVariable
 
 
 def materialize(project, run_name=None, select=None):
@@ -1000,3 +1001,216 @@ def test_the_store_root_override_beats_the_manifest_field(project, tmp_path):
         assert job.execute_in_process(instance=instance, raise_on_error=False).success
     assert (elsewhere / "rows.txt").read_text() == "ok"
     assert not (written.root / "build").exists()
+
+
+# --- global retries default (DESIGN §5.1) ----------------------------------
+
+
+RETRY_MANIFEST = """
+    [nodes.inherits]
+    fn = "MOD.a"
+    outputs = ["out"]
+
+    [nodes.overrides]
+    fn = "MOD.a"
+    outputs = ["out"]
+    retries = { max = 1 }
+
+    [nodes.opts_out]
+    fn = "MOD.a"
+    outputs = ["out"]
+    retries = { max = 0 }
+"""
+
+
+def policies(project_files):
+    defs = build(project_files.manifest_path)
+    return {a.op.name: a.op.retry_policy for a in defs.assets}
+
+
+def test_nodes_inherit_the_pipeline_retry_policy(project):
+    written = project(
+        pipeline="retries = { max = 3, wait_s = 10 }",
+        manifest=RETRY_MANIFEST,
+        module="def a(ctx):\n    return {'out': 1}\n",
+    )
+    found = policies(written)
+    assert found["inherits"] == dg.RetryPolicy(max_retries=3, delay=10.0)
+
+
+def test_a_node_override_replaces_the_whole_policy_rather_than_merging(project):
+    """`max = 1` alone means wait_s goes back to 0, not 10."""
+    written = project(
+        pipeline="retries = { max = 3, wait_s = 10 }",
+        manifest=RETRY_MANIFEST,
+        module="def a(ctx):\n    return {'out': 1}\n",
+    )
+    found = policies(written)
+    assert found["overrides"] == dg.RetryPolicy(max_retries=1, delay=0.0)
+    assert found["opts_out"] == dg.RetryPolicy(max_retries=0, delay=0.0)
+
+
+def test_no_retries_anywhere_means_no_retry_policy(project):
+    written = project(
+        RETRY_MANIFEST.replace("    retries = { max = 1 }\n", "").replace(
+            "    retries = { max = 0 }\n", ""
+        ),
+        module="def a(ctx):\n    return {'out': 1}\n",
+    )
+    assert set(policies(written).values()) == {None}
+
+
+def test_the_inherited_policy_actually_retries(project):
+    written = project(
+        pipeline="retries = { max = 2 }",
+        manifest="""
+        [nodes.flaky]
+        fn = "MOD.flaky"
+        outputs = ["out"]
+        """,
+        module="""
+        from pathlib import Path
+
+        MARKER = Path(__file__).with_suffix(".attempts")
+
+        def flaky(ctx):
+            attempts = int(MARKER.read_text()) if MARKER.exists() else 0
+            MARKER.write_text(str(attempts + 1))
+            if attempts < 2:
+                raise RuntimeError("flaky")
+            return {"out": attempts}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert result.output_for_node("flaky", "out") == 2
+
+
+# --- env-sourced variables (DESIGN §5.3) -----------------------------------
+
+
+ENV_MANIFEST = """
+    [vars]
+    token = { type = "str", env = "DAGNET_TEST_TOKEN" }
+    workers = { type = "int", env = "DAGNET_TEST_WORKERS", default = 1 }
+
+    [nodes.a]
+    fn = "MOD.a"
+    outputs = ["seen"]
+"""
+
+ENV_MODULE = "def a(ctx):\n    return {'seen': dict(ctx.vars)}\n"
+
+
+def test_a_variable_takes_its_value_from_the_named_environment_variable(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_TOKEN", "from-the-environment")
+    monkeypatch.setenv("DAGNET_TEST_WORKERS", "8")
+    written = project(ENV_MANIFEST, module=ENV_MODULE)
+    result = materialize(written)
+    assert result.success, result
+    assert result.output_for_node("a", "seen") == {
+        "token": "from-the-environment",
+        "workers": 8,
+    }
+
+
+def test_a_run_value_beats_the_environment(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_TOKEN", "from-the-environment")
+    written = project(
+        ENV_MANIFEST, module=ENV_MODULE, runs='[runs.explicit]\ntoken = "from-the-run"\n'
+    )
+    result = materialize(written, run_name="explicit")
+    assert result.output_for_node("a", "seen")["token"] == "from-the-run"
+
+
+def test_the_environment_beats_a_declared_default(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_TOKEN", "t")
+    monkeypatch.setenv("DAGNET_TEST_WORKERS", "16")
+    written = project(ENV_MANIFEST, module=ENV_MODULE)
+    assert materialize(written).output_for_node("a", "seen")["workers"] == 16
+
+
+def test_a_declared_default_applies_when_the_environment_is_silent(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_TOKEN", "t")
+    monkeypatch.delenv("DAGNET_TEST_WORKERS", raising=False)
+    written = project(ENV_MANIFEST, module=ENV_MODULE)
+    assert materialize(written).output_for_node("a", "seen")["workers"] == 1
+
+
+def test_an_unset_variable_names_both_itself_and_the_env_var(project, monkeypatch):
+    monkeypatch.delenv("DAGNET_TEST_TOKEN", raising=False)
+    written = project(ENV_MANIFEST, module=ENV_MODULE)
+    with pytest.raises(UnresolvedVariable) as excinfo:
+        build_job(str(written.manifest_path), [], executor="in_process")
+    message = str(excinfo.value)
+    assert "'token'" in message and "DAGNET_TEST_TOKEN" in message
+
+
+def test_an_env_value_of_the_wrong_type_is_a_loud_error(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_TOKEN", "t")
+    monkeypatch.setenv("DAGNET_TEST_WORKERS", "loads")
+    written = project(ENV_MANIFEST, module=ENV_MODULE)
+    with pytest.raises(BadEnvironmentValue, match="DAGNET_TEST_WORKERS"):
+        build_job(str(written.manifest_path), [], executor="in_process")
+
+
+@pytest.mark.parametrize(
+    "raw,expected", [("true", True), ("FALSE", False), ("1", True), ("off", False)]
+)
+def test_booleans_from_the_environment(project, monkeypatch, raw, expected):
+    monkeypatch.setenv("DAGNET_TEST_FLAG", raw)
+    written = project(
+        """
+        [vars]
+        flag = { type = "bool", env = "DAGNET_TEST_FLAG" }
+
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["seen"]
+        """,
+        module="def a(ctx):\n    return {'seen': ctx.vars['flag']}\n",
+    )
+    assert materialize(written).output_for_node("a", "seen") is expected
+
+
+def test_a_node_local_env_declaration_shadows_the_global_one(project, monkeypatch):
+    monkeypatch.setenv("DAGNET_TEST_GLOBAL", "global-value")
+    monkeypatch.setenv("DAGNET_TEST_NODE", "node-value")
+    written = project(
+        """
+        [vars]
+        endpoint = { type = "str", env = "DAGNET_TEST_GLOBAL" }
+
+        [nodes.plain]
+        fn = "MOD.show"
+        outputs = ["seen"]
+
+        [nodes.special]
+        fn = "MOD.show"
+        outputs = ["seen"]
+
+        [nodes.special.vars]
+        endpoint = { type = "str", env = "DAGNET_TEST_NODE" }
+        """,
+        module="def show(ctx):\n    return {'seen': ctx.vars['endpoint']}\n",
+    )
+    result = materialize(written)
+    assert result.output_for_node("plain", "seen") == "global-value"
+    assert result.output_for_node("special", "seen") == "node-value"
+
+
+def test_defaults_apply_to_a_run_with_no_preset(project):
+    """`[defaults]` is the base for every run, including one that names no preset."""
+    written = project(
+        """
+        [vars]
+        n = { type = "int", default = 1 }
+
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["seen"]
+        """,
+        module="def a(ctx):\n    return {'seen': ctx.vars['n']}\n",
+        runs="[defaults]\nn = 99\n\n[runs.other]\nn = 5\n",
+    )
+    assert materialize(written).output_for_node("a", "seen") == 99

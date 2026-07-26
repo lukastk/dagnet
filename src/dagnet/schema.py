@@ -35,6 +35,13 @@ class Base(msgspec.Struct, forbid_unknown_fields=True, kw_only=True):
     pass
 
 
+class Retries(Base):
+    """`retries = { max = 3, wait_s = 10 }` (DESIGN §5.1, §5.5)."""
+
+    max: int
+    wait_s: float = 0.0
+
+
 class Pipeline(Base):
     """`[pipeline]` — metadata (DESIGN §5.1)."""
 
@@ -45,22 +52,31 @@ class Pipeline(Base):
     dagster_home: str = ".dagster"
     #: Where file artifacts resolve. Same resolution rule; `--store-root` overrides.
     store_root: str = "."
+    #: The default retry policy for every node. A node's own `retries` replaces
+    #: this **entirely** — an override is the whole policy, not a field-wise
+    #: merge. Absent here and on the node means no retry.
+    retries: Retries | None = None
 
 
 class VarDecl(Base):
     """One entry of `[vars]` or `[nodes.<n>.vars]` (DESIGN §5.3).
 
-    `default is UNSET` means the variable has no default and must be supplied by
-    the run preset — distinct from a declared default that happens to be falsy.
+    `default is UNSET` means the variable has no default — distinct from a
+    declared default that happens to be falsy.
     """
 
     type: VarType
     default: Union[Any, UnsetType] = UNSET
+    #: An environment variable to take the value from when no run preset sets it.
+    #: Naming it here is the point: configuration stays discoverable from the map
+    #: rather than being orphan knowledge in someone's shell profile.
+    env: str | None = None
     description: str = ""
 
     @property
     def required(self) -> bool:
-        return self.default is UNSET
+        """True when nothing but a run preset can supply this variable."""
+        return self.default is UNSET and self.env is None
 
 
 class FileArtifact(Base, tag="file", tag_field="kind"):
@@ -84,13 +100,6 @@ class DuckDBTableArtifact(Base, tag="duckdb_table", tag_field="kind"):
 
 
 Artifact = Union[FileArtifact, DuckDBTableArtifact]
-
-
-class Retries(Base):
-    """`retries = { max = 3, wait_s = 10 }` (DESIGN §5.5)."""
-
-    max: int
-    wait_s: float = 0.0
 
 
 class CheckDecl(Base):

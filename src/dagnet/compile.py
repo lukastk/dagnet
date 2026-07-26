@@ -45,7 +45,7 @@ from dagnet.graph import ArtifactRef, NodeRef, PipelineGraph, asset_key
 from dagnet.locations import store_root as resolve_store_root
 from dagnet.nodefn import NodeFunction, describe, import_object
 from dagnet.partition import Cluster, config_path, partition
-from dagnet.runs import declaration_for, resolve_run
+from dagnet.runs import UnresolvedVariable, declaration_for, resolve_run, unfilled_variables
 from dagnet.schema import CheckDecl, Manifest, Node, as_check_decl
 
 #: The resource key carrying run-wide information into every node.
@@ -191,7 +191,7 @@ def _compile_node(
         description=node.description or None,
         group_name=node.group,
         pool=node.pool,
-        retry_policy=_retry_policy(node),
+        retry_policy=_retry_policy(manifest, node),
         config_schema=_config_schema(manifest, node_name) or None,
         required_resource_keys={RESOURCE_KEY},
         # Selecting one output of a multi-output node must not be an error, so the
@@ -331,7 +331,7 @@ def _compile_op(
         out=outs,
         description=node.description or None,
         pool=node.pool,
-        retry_policy=_retry_policy(node),
+        retry_policy=_retry_policy(manifest, node),
         config_schema=_config_schema(manifest, node_name) or None,
         required_resource_keys={RESOURCE_KEY},
     )(compute)
@@ -603,10 +603,17 @@ def _dedupe_deps(deps: list[dg.AssetKey], ins: dict[str, dg.AssetIn]) -> list[dg
     return out
 
 
-def _retry_policy(node: Node) -> dg.RetryPolicy | None:
-    if node.retries is None:
+def _retry_policy(manifest: Manifest, node: Node) -> dg.RetryPolicy | None:
+    """A node's own `retries` replaces `[pipeline].retries` entirely (DESIGN §5.1).
+
+    Deliberately not a field-wise merge: an override is the whole policy, so
+    reading a node's `retries` tells you what that node does without also having
+    to read the pipeline header.
+    """
+    retries = node.retries if node.retries is not None else manifest.pipeline.retries
+    if retries is None:
         return None
-    return dg.RetryPolicy(max_retries=node.retries.max, delay=node.retries.wait_s)
+    return dg.RetryPolicy(max_retries=retries.max, delay=retries.wait_s)
 
 
 def _config_schema(manifest: Manifest, node_name: str) -> dict[str, dg.Field]:
@@ -739,10 +746,16 @@ def run_config(manifest: Manifest, result: CheckResult, run_name: str | None) ->
     rather than being assumed flat.
     """
     config: dict[str, Any] = {"resources": {RESOURCE_KEY: {"config": {"run_name": run_name or ""}}}}
-    if run_name is None:
-        return config
 
-    resolved = resolve_run(manifest, result.runs, run_name)
+    # No preset still resolves: `[defaults]`, the environment and the declared
+    # defaults all apply — a run without a preset is not a run without config.
+    resolved = resolve_run(manifest, result.runs, run_name or "")
+    missing = unfilled_variables(manifest, resolved)
+    if missing:
+        launching = f"run '{run_name}'" if run_name else "this run"
+        raise UnresolvedVariable(
+            f"{launching} cannot start:\n" + "\n".join(f"  - {m.describe()}" for m in missing)
+        )
     for cluster in partition(manifest, result.graph):
         for node_name in cluster.members:
             values = resolved.per_node.get(node_name)

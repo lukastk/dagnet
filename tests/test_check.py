@@ -11,8 +11,14 @@ from dagnet.check import check
 def checked_project(project):
     """Write a throwaway project and return its `check` result."""
 
-    def _check(manifest: str, module: str | None = None, runs: str | None = None, **kwargs):
-        written = project(manifest, module, runs)
+    def _check(
+        manifest: str,
+        module: str | None = None,
+        runs: str | None = None,
+        pipeline: str = "",
+        **kwargs,
+    ):
+        written = project(manifest, module, runs, pipeline=pipeline)
         kwargs.setdefault("import_functions", module is not None)
         return check(written.manifest_path, written.runs_paths, **kwargs)
 
@@ -735,3 +741,85 @@ def test_both_check_forms_are_accepted_and_validated(project):
     )
     assert result.diagnostics.codes() == ["check-missing-attribute"]
     assert result.diagnostics.errors[0].location.path == "nodes.a.checks.rows[2]"
+
+
+# --- retries (DESIGN §5.1) -------------------------------------------------
+
+
+def test_a_negative_retry_count_is_rejected_at_either_level(project):
+    result = project(
+        pipeline="retries = { max = -1 }",
+        manifest="""
+        [nodes.a]
+        fn = "m.a"
+        outputs = ["out"]
+        retries = { max = 2, wait_s = -3 }
+    """,
+    )
+    assert result.diagnostics.codes().count("invalid-retries") == 2
+    paths = [d.location.path for d in result.diagnostics.errors]
+    assert paths == ["pipeline.retries.max", "nodes.a.retries.wait_s"]
+
+
+def test_zero_retries_is_allowed_and_means_never(project):
+    result = project(
+        pipeline="retries = { max = 3 }",
+        manifest="""
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["out"]
+        retries = { max = 0 }
+        """,
+        module="def a(ctx):\n    return {'out': 1}\n",
+    )
+    assert result.ok, result.diagnostics.render()
+
+
+# --- env-sourced variables (DESIGN §5.3) -----------------------------------
+
+
+def test_an_unusable_env_name_is_rejected(project):
+    result = project("""
+        [vars]
+        token = { type = "str", env = "not a name" }
+
+        [nodes.a]
+        fn = "m.a"
+        outputs = ["out"]
+    """)
+    assert "invalid-env-name" in result.diagnostics.codes()
+    assert result.diagnostics.errors[0].location.path == "vars.token.env"
+
+
+def test_a_declared_default_must_match_its_declared_type(project):
+    result = project("""
+        [vars]
+        n = { type = "int", default = "ten" }
+
+        [nodes.a]
+        fn = "m.a"
+        outputs = ["out"]
+
+        [nodes.a.vars]
+        flag = { type = "bool", default = 1 }
+    """)
+    assert result.diagnostics.codes().count("var-type-mismatch") == 2
+
+
+def test_a_var_with_env_is_not_reported_unfilled_at_check_time(project, monkeypatch):
+    """Whether some machine exports it must not change what `check` says."""
+    monkeypatch.delenv("DAGNET_TEST_TOKEN", raising=False)
+    manifest = """
+        [vars]
+        token = { type = "str", env = "DAGNET_TEST_TOKEN" }
+        plain = { type = "str" }
+
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["out"]
+    """
+    module = "def a(ctx):\n    return {'out': 1}\n"
+    result = project(manifest, module=module, runs="[runs.only]\n")
+    # `plain` has no default and no env, so it must be set; `token` need not be.
+    assert result.diagnostics.codes() == ["unfilled-var"]
+    assert "'plain'" in result.diagnostics.errors[0].message
