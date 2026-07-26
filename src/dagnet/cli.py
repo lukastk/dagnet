@@ -16,7 +16,7 @@ from pathlib import Path
 from dagnet import __version__
 from dagnet.check import CheckResult, check
 from dagnet.diagnostics import DagnetError
-from dagnet.graph import PipelineGraph
+from dagnet.graph import PipelineGraph, asset_key
 from dagnet.instance import open_instance, pool_granularity_is_op, sync_pools
 from dagnet.locations import dagster_home
 from dagnet.mermaid import to_mermaid
@@ -84,6 +84,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # Before anything is launched: build the job here in the parent so the
+    # selection can be resolved to concrete keys, then let `[pipeline] pre_run`
+    # hooks refuse the launch. Nothing has materialized at this point.
+    if result.manifest.pipeline.pre_run and _pre_run_refuses(
+        args, result, manifest_path, runs_paths
+    ):
+        return EXIT_FAILED
+
     job = reconstructable_job(
         manifest=str(manifest_path),
         runs=[str(p) for p in runs_paths],
@@ -122,6 +130,14 @@ def cmd_dev(args: argparse.Namespace) -> int:
         print(result.diagnostics.render(), file=sys.stderr)
         return EXIT_FAILED
     _report_warnings(result)
+
+    if result.manifest.pipeline.pre_run:
+        print(
+            "dagnet: warning: runs launched from the Dagster UI do NOT pass through "
+            f"dagnet, so the {len(result.manifest.pipeline.pre_run)} [pipeline].pre_run "
+            "hook(s) will not run for them",
+            file=sys.stderr,
+        )
 
     home = dagster_home(result.manifest, manifest_path, args.dagster_home)
     defs_path = _write_defs_module(home, manifest_path, runs_paths)
@@ -195,6 +211,55 @@ def _first_existing(directory: Path, names: tuple[str, ...]) -> Path | None:
 def _report_warnings(result: CheckResult) -> None:
     for diagnostic in result.diagnostics.warnings:
         print(diagnostic.render(), file=sys.stderr)
+
+
+def _pre_run_refuses(
+    args: argparse.Namespace,
+    result: CheckResult,
+    manifest_path: Path,
+    runs_paths: list[Path],
+) -> bool:
+    """Run the `pre_run` hooks. True means: do not launch.
+
+    An ERROR from any hook aborts; WARNINGs print and the run proceeds. This is
+    dagnet's launch path only — a run started from the Dagster UI's launchpad
+    never passes through here (DESIGN §8).
+    """
+    from dagnet.compile import build_job, run_config
+    from dagnet.prerun import PreRunContext, run_hooks
+
+    job = build_job(
+        str(manifest_path),
+        [str(p) for p in runs_paths],
+        run_name=args.run_name,
+        select=args.select,
+        store_root=args.store_root,
+        executor="in_process",
+    )
+    asset_keys = sorted(key.to_user_string() for key in job.asset_layer.selected_asset_keys)
+    context = PreRunContext(
+        manifest_path=manifest_path.resolve(),
+        run_name=args.run_name,
+        selection=args.select,
+        node_names=tuple(_nodes_for(result, asset_keys)),
+        asset_keys=tuple(asset_keys),
+        run_config=run_config(result.manifest, result, args.run_name),
+    )
+
+    diagnostics = run_hooks(result.manifest.pipeline.pre_run, context)
+    if diagnostics.items:
+        print(diagnostics.render(), file=sys.stderr)
+    return bool(diagnostics.errors)
+
+
+def _nodes_for(result: CheckResult, asset_keys: list[str]) -> list[str]:
+    """Which nodes produce these asset keys, sorted and deduplicated."""
+    owners = {
+        "/".join(asset_key(result.manifest, node_name, output)): node_name
+        for node_name, node in result.manifest.nodes.items()
+        for output in node.outputs
+    }
+    return sorted({owners[key] for key in asset_keys if key in owners})
 
 
 def _reexecution_options(args: argparse.Namespace, instance):

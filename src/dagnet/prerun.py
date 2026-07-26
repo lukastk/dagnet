@@ -1,0 +1,113 @@
+"""`[pipeline] pre_run` — validation hooks that run before any materialization.
+
+A hook is a plain callable named in the map like everything else
+(`module.path:callable`). It receives a `PreRunContext` describing the launch
+about to happen and either returns a `Diagnostics` or raises. Any ERROR-severity
+diagnostic aborts the launch with the same aggregated, located output `dagnet
+check` produces; WARNING severity prints and the run proceeds.
+
+The point is refusal *before* work starts — an advisory command a careful person
+remembers to run is no protection against the person who doesn't think to run it.
+
+**Scope, stated plainly:** hooks run on dagnet's own launch paths — `dagnet run`,
+with or without `--select`, and `--from-failure`. A run launched from the Dagster
+UI's launchpad **bypasses them entirely**, because that launch never passes
+through dagnet. Covering the UI too would mean compiling a guard step into the
+graph upstream of everything; that was considered and deferred (DESIGN §12).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from dagnet.diagnostics import DagnetError, Diagnostics, Location
+from dagnet.nodefn import ImportFailure, import_entry_point
+
+
+class PreRunReturnError(DagnetError):
+    """A hook returned something that is not a `Diagnostics`."""
+
+
+class PreRunHookError(DagnetError):
+    """A hook could not be imported when it was needed."""
+
+
+@dataclass(frozen=True)
+class PreRunContext:
+    """What a `pre_run` hook is told about the launch it may refuse."""
+
+    #: Absolute path of the manifest this launch was compiled from.
+    manifest_path: Path
+    #: The run preset's name, or None when launched without one.
+    run_name: str | None
+    #: The `--select` expression exactly as given, or None meaning everything.
+    #: `is_everything` is the readable form of that test.
+    selection: str | None
+    #: Node names this launch will run, sorted.
+    node_names: tuple[str, ...] = ()
+    #: Asset keys this launch will materialize, in `namespace/name` form, sorted.
+    asset_keys: tuple[str, ...] = ()
+    #: The resolved Dagster run config: variables per node, plus the run name.
+    run_config: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_everything(self) -> bool:
+        """True when no `--select` was given, i.e. the whole pipeline is in scope.
+
+        Note this describes the *selection*, not the set of steps that will end up
+        executing: `--from-failure` re-executes a subset of the same selection.
+        """
+        return self.selection is None
+
+    def location(self, path: str | None = None) -> Location:
+        """A `Location` in this manifest, for a hook building its own diagnostics."""
+        return Location(file=self.manifest_path, path=path)
+
+
+def load_hooks(paths: list[str]) -> list[tuple[str, Callable[..., Any]]]:
+    """Import every declared hook. Raises rather than launching with a broken one."""
+    loaded: list[tuple[str, Callable[..., Any]]] = []
+    for path in paths:
+        hook = import_entry_point(path)
+        if isinstance(hook, ImportFailure):
+            raise PreRunHookError(f"pre_run hook '{path}': {hook.detail}")
+        loaded.append((path, hook))
+    return loaded
+
+
+def run_hooks(paths: list[str], context: PreRunContext) -> Diagnostics:
+    """Run every declared hook and collect what they all say.
+
+    Every hook runs even if an earlier one objected: the point of aggregated
+    diagnostics is that a person sees all of it in one pass. A hook that raises
+    becomes an ERROR diagnostic naming the hook, so one broken hook cannot let a
+    launch through and the output stays uniform.
+    """
+    diagnostics = Diagnostics()
+    for path, hook in load_hooks(paths):
+        try:
+            returned = hook(context)
+        except Exception as exc:
+            diagnostics.error(
+                "pre-run-refused",
+                f"pre_run hook '{path}' refused this run: {exc}",
+                context.location("pipeline.pre_run"),
+                hint=f"raised {type(exc).__name__}",
+            )
+            continue
+        diagnostics.extend(_as_diagnostics(path, returned, context))
+    return diagnostics
+
+
+def _as_diagnostics(path: str, returned: Any, context: PreRunContext) -> Diagnostics:
+    """A hook returns a `Diagnostics`, or None when it has nothing to say."""
+    if returned is None:
+        return Diagnostics()
+    if isinstance(returned, Diagnostics):
+        return returned
+    raise PreRunReturnError(
+        f"pre_run hook '{path}' must return a Diagnostics (or None), "
+        f"but returned {type(returned).__name__}"
+    )

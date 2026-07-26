@@ -67,6 +67,11 @@ class NodeFunction:
     return_outputs: dict[str, str] = field(default_factory=dict)
 
 
+#: `pre_run` hooks are written entry-point style, so the module/attribute split
+#: is explicit rather than inferred from the last dot.
+ENTRY_POINT_SEPARATOR = ":"
+
+
 def import_object(path: str) -> Any | ImportFailure:
     """Import `pkg.module.attribute`. Never guesses; every failure mode is distinct."""
     module_path, _, attribute = path.rpartition(".")
@@ -75,6 +80,25 @@ def import_object(path: str) -> Any | ImportFailure:
             ImportProblem.MALFORMED_PATH,
             f"'{path}' is not a dotted path to a function",
         )
+    return _import_attribute(module_path, attribute, path)
+
+
+def import_entry_point(path: str) -> Any | ImportFailure:
+    """Import `pkg.module:attribute` — the explicit form `pre_run` hooks use."""
+    module_path, separator, attribute = path.partition(ENTRY_POINT_SEPARATOR)
+    if not separator or not module_path or not attribute:
+        suggestion = ""
+        if ENTRY_POINT_SEPARATOR not in path and "." in path:
+            module, _, attr = path.rpartition(".")
+            suggestion = f"; did you mean '{module}{ENTRY_POINT_SEPARATOR}{attr}'?"
+        return ImportFailure(
+            ImportProblem.MALFORMED_PATH,
+            f"'{path}' is not of the form 'module.path{ENTRY_POINT_SEPARATOR}callable'{suggestion}",
+        )
+    return _import_attribute(module_path, attribute, path)
+
+
+def _import_attribute(module_path: str, attribute: str, path: str) -> Any | ImportFailure:
     try:
         module = importlib.import_module(module_path)
     except ModuleNotFoundError as exc:

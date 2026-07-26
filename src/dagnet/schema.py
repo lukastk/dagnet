@@ -56,6 +56,9 @@ class Pipeline(Base):
     #: this **entirely** — an override is the whole policy, not a field-wise
     #: merge. Absent here and on the node means no retry.
     retries: Retries | None = None
+    #: Validation hooks run before any materialization, as `module.path:callable`
+    #: (DESIGN §8). Empty means no hooks and no behaviour change.
+    pre_run: list[str] = []
 
 
 class VarDecl(Base):

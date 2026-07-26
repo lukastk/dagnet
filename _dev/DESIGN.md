@@ -361,6 +361,12 @@ Pool *limits* are instance state, not definition state: `pool = "heavy"` on a no
 - **`dagnet run <run_name> --from-failure <run_id|last>`** — resume a failed run, skipping the steps that already succeeded. Spike (e) confirmed this works from library mode and reaches individual ops inside graph-backed assets, so it is what replaces Scuttlebug's hand-rolled `skip_if_done` *(added 2026-07-27; §8 previously put re-execution only in `dagnet dev`)*.
 - **`dagnet graph`** — Mermaid export from the manifest (no Dagster needed), for READMEs.
 
+**Pre-run validation hooks.** `[pipeline] pre_run = ["module.path:callable", ...]` declares callables that run **before any materialization** on every dagnet launch path — plain `run`, `--select`, and `--from-failure`. Each receives a `PreRunContext` (the manifest path, the run preset's name, the selection resolved to concrete node names and asset keys — or "everything" — and the resolved run config) and either returns a `Diagnostics` or raises. Any ERROR-severity diagnostic aborts the launch with the same aggregated, located output `dagnet check` produces; WARNING prints and the run proceeds. A hook that raises becomes an ERROR naming it, so a broken guard cannot let a launch through. Every hook runs even after one objects, so a person sees all objections at once. Absent or empty means no hooks and no behaviour change. Hooks are named in the map like everything else, so a reader can see what guards a pipeline without reading any Python.
+
+The point is *refusal before work starts*: an advisory command only protects the person who thinks to run it, and the failure mode being guarded against is precisely the person who doesn't.
+
+**The scope is dagnet's own launch paths, and that is a real limit.** A run launched from the Dagster UI's launchpad **bypasses `pre_run` entirely**, because that launch never passes through dagnet — Dagster loads the `Definitions` and executes them directly. `dagnet dev` prints a warning saying so when a manifest declares hooks. Do not describe `pre_run` as a guarantee about a pipeline; it is a guarantee about the CLI.
+
 The run-preset name is **optional**: `dagnet run` with no preset uses the declared defaults, so a project with no runs file works. `ctx.run_name` is `""` in that case *(decided 2026-07-27)*.
 
 Multiprocess execution needs one piece of plumbing DESIGN did not anticipate: `materialize(...)` and `execute_in_process(...)` always run in-process whatever executor a job names, so real multiprocess requires `execute_job` with a *reconstructable* job. Since dagnet's job is built at runtime from a manifest path, a module-level reconstructor entry point (`dagnet/_reconstruct.py`) rebuilds it in each step subprocess from JSON-serializable arguments (spike (b)).
@@ -431,6 +437,9 @@ Building `sample_projects/09_ai_index` — a topologically faithful replica of t
 `dagnet-db` is a sibling package built against dagnet as a git dependency, providing helpers a node opts into (its `init`/`connect`).
 
 - [P] **`ctx.node_name` and `ctx.manifest_path`** (§7 rule 3): two read-only properties on the node context. A helper called from inside a node body needs to know which node is calling it and where the map is; the manifest is a pipeline's discovery root, so exposing its path is aligned with the rest of the design, and resolving anything cwd-relative would be fragile — a multiprocess step runs in its own process. `manifest_path` is absolute, resolved once at compile time. Pure additions: no semantic change, nothing existing altered, no version-scheme change.
+- [P] **`[pipeline] pre_run` validation hooks** (§8): a generic seam for refusing a launch before any materialization, needed by dagnet-db's partial-rebuild guard. Hooks are import paths in the map, receive the resolved launch, and return a `Diagnostics` or raise; ERROR aborts, WARNING proceeds. Empty or absent means no behaviour change.
+  - **Scope is CLI-only, stated rather than papered over.** UI launchpad runs bypass it.
+  - [D] **Considered and deferred: an in-graph guard step** — compiling a validation op upstream of everything, so a UI launch would hit it too. It would close the gap, but it puts a dagnet-owned step inside the user's asset graph, it would show in the catalog and the run timeline as if it were part of the pipeline, and its failure mode (a run that starts, then fails at step one) is worse than a launch that never starts. Not built. Revisit only if UI-launched runs turn out to be a real path for a pipeline that needs guarding.
 
 ### Not being done
 

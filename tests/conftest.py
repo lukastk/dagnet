@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,19 @@ class Project:
     runs_paths: list[Path] = field(default_factory=list)
     module: str = ""
     root: Path = Path(".")
+
+
+@pytest.fixture
+def importable_in_subprocesses(tmp_path, monkeypatch):
+    """Step subprocesses don't inherit `sys.path`, only the environment.
+
+    Real projects don't need this: their package is installed into the venv the
+    subprocess starts from.
+    """
+    existing = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{tmp_path}{os.pathsep}{existing}" if existing else str(tmp_path)
+    )
 
 
 @pytest.fixture
@@ -61,7 +75,9 @@ def project(tmp_path, monkeypatch):
         if pipeline:
             header = f'[pipeline]\nname = "p"\n{textwrap.dedent(pipeline).strip()}\n\n'
         manifest_path = tmp_path / f"pipeline_{suffix}.toml"
-        manifest_path.write_text(header + textwrap.dedent(manifest).replace("MOD", name))
+        # MOD is substituted across the whole file, header included, so extra
+        # `[pipeline]` keys can name the generated module too.
+        manifest_path.write_text((header + textwrap.dedent(manifest)).replace("MOD", name))
         runs_paths = []
         if runs is not None:
             runs_path = tmp_path / f"runs_{suffix}.toml"

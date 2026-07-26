@@ -45,6 +45,7 @@ from dagnet.nodefn import (
     NodeFunction,
     ReturnKind,
     describe,
+    import_entry_point,
     import_object,
 )
 from dagnet.runs import validate_runs, value_matches
@@ -113,6 +114,7 @@ def check(
     if import_functions:
         functions = _check_functions(manifest, root, diags)
         _check_wired_annotations(manifest, graph, functions, root, diags)
+        _check_pre_run_hooks(manifest, root, diags)
 
     validate_runs(manifest, registry, diags)
 
@@ -646,6 +648,18 @@ def _check_return_annotation(
             loc,
             hint="outputs bound to artifacts are written by the node, not returned",
         )
+
+
+def _check_pre_run_hooks(manifest: Manifest, root: Location, diags: Diagnostics) -> None:
+    """`[pipeline] pre_run` paths must import, so a launch never fails on a typo."""
+    for index, path in enumerate(manifest.pipeline.pre_run):
+        result = import_entry_point(path)
+        if isinstance(result, ImportFailure):
+            diags.error(
+                f"pre-run-{_IMPORT_CODES[result.problem]}",
+                f"pre_run hook: {result.detail}",
+                root.child("pipeline", "pre_run").child(index),
+            )
 
 
 def _check_wired_annotations(

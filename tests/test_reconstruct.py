@@ -15,22 +15,8 @@ from __future__ import annotations
 import os
 
 import dagster as dg
-import pytest
 
 from dagnet._reconstruct import reconstructable_job
-
-
-@pytest.fixture
-def importable_in_subprocesses(tmp_path, monkeypatch):
-    """Step subprocesses don't inherit `sys.path`, only the environment.
-
-    Real projects don't need this: their package is installed into the venv the
-    subprocess starts from.
-    """
-    existing = os.environ.get("PYTHONPATH")
-    monkeypatch.setenv(
-        "PYTHONPATH", f"{tmp_path}{os.pathsep}{existing}" if existing else str(tmp_path)
-    )
 
 
 def run_multiprocess(project, run_name=None) -> bool:

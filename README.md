@@ -63,6 +63,45 @@ node am I, and where is the map?" without resolving anything relative to the wor
 directory, which is not stable across executors — each step of a multiprocess run is
 its own process.
 
+## Pre-run validation hooks
+
+A pipeline can refuse its own launches. `[pipeline] pre_run` names callables that
+run **before anything materializes**:
+
+```toml
+[pipeline]
+name = "warehouse"
+pre_run = ["warehouse.guards:no_partial_rebuild"]
+```
+
+```python
+# warehouse/guards.py — plain Python, like everything else
+from dagnet.diagnostics import Diagnostics
+
+def no_partial_rebuild(context):
+    diagnostics = Diagnostics()
+    if not context.is_everything and "db/facts" in context.asset_keys:
+        diagnostics.error(
+            "partial-rebuild", "rebuilding db/facts alone would orphan its dimensions",
+            context.location("pipeline.pre_run"),
+            hint="rerun without --select, or select the whole group",
+        )
+    return diagnostics
+```
+
+The hook is told `manifest_path`, `run_name`, `selection` (the `--select`
+expression, or `None` meaning everything — `is_everything` reads better),
+`node_names` and `asset_keys` (the selection resolved against the real graph),
+and `run_config`. It returns a `Diagnostics`, or `None` if it has nothing to say,
+or raises. **Any error aborts the launch** with the usual aggregated output and a
+nonzero exit; warnings print and the run proceeds. Every hook runs even after one
+objects, so you see all the objections at once.
+
+> **Scope: this covers `dagnet run` — not the Dagster UI.** A run launched from the
+> launchpad never passes through dagnet, so `pre_run` hooks do not run for it.
+> `dagnet dev` warns about this when a manifest declares hooks. Treat `pre_run` as
+> a guarantee about the CLI, not about the pipeline.
+
 ## Status
 
 **v0 is built** — the manifest and runs schema, `dagnet check`, the compiler to Dagster
