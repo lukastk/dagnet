@@ -1,21 +1,29 @@
 [pipeline]
 name = "artifacts"
 description = "Durable objects with declared locations: files and DuckDB tables."
+# Where file artifacts resolve, relative to this file. `--store-root` overrides it.
+store_root = "build"
+
+# Both loaders open the same DuckDB file for writing, and DuckDB takes an
+# exclusive lock. They have no ordering relationship — they simply must not run
+# at the same time. That is what a pool is for.
+[pools]
+duckdb_writer = 1
 
 # This section replaces a hand-maintained paths.py. Every location is stated once,
 # here, and both the producing node and any consuming node resolve it through the
-# manifest via ctx.artifact(). File paths resolve relative to the manifest.
+# manifest via ctx.artifact(). File paths resolve under [pipeline].store_root.
 [artifacts]
 
-# The database file itself is an artifact, so its location is declared too. No
-# node lists it as an input — it is resolved directly with ctx.artifact().
-"db/warehouse" = { kind = "file", path = "build/warehouse.duckdb" }
+# The database file itself is an artifact, so its location is declared too, and
+# each table says which database it is in.
+"db/warehouse" = { kind = "file", path = "warehouse.duckdb" }
 
-"raw/customers" = { kind = "file", path = "build/raw/customers.json" }
-"raw/orders" = { kind = "file", path = "build/raw/orders.json" }
+"raw/customers" = { kind = "file", path = "raw/customers.json" }
+"raw/orders" = { kind = "file", path = "raw/orders.json" }
 
-"db/customers" = { kind = "duckdb_table", table = "customers" }
-"db/orders" = { kind = "duckdb_table", table = "orders" }
+"db/customers" = { kind = "duckdb_table", table = "customers", database = "db/warehouse" }
+"db/orders" = { kind = "duckdb_table", table = "orders", database = "db/warehouse" }
 
 [nodes.extract_customers]
 fn = "artifacts_pipeline.nodes.extract_customers"
@@ -37,6 +45,7 @@ fn = "artifacts_pipeline.nodes.load_customers"
 inputs = { source = "raw/customers" }
 outputs = ["customers"]
 artifacts = { customers = "db/customers" }
+pool = "duckdb_writer"
 group = "load"
 
 [nodes.load_orders]
@@ -44,9 +53,8 @@ fn = "artifacts_pipeline.nodes.load_orders"
 inputs = { source = "raw/orders" }
 outputs = ["orders"]
 artifacts = { orders = "db/orders" }
+pool = "duckdb_writer"
 group = "load"
-# Both loaders write the same DuckDB file, so they must not run concurrently.
-after = ["load_customers"]
 
 [nodes.report]
 fn = "artifacts_pipeline.nodes.report"

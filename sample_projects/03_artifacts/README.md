@@ -14,8 +14,9 @@ contains a path or a table name.
   node returns nothing — `extract_customers` is annotated `-> None` — and dagnet
   records the materialization, with the declared location as asset metadata.
 - **`ctx.artifact(key)` resolves by kind.** A `file` artifact resolves to a `Path`
-  (relative to the manifest); a `duckdb_table` artifact resolves to the table's
-  *name*. An undeclared key raises, with a did-you-mean hint.
+  under `[pipeline].store_root`; a `duckdb_table` artifact resolves to a frozen
+  handle carrying `.table` and `.database` (itself a resolved `Path`). An
+  undeclared key raises, with a did-you-mean hint.
 - **An artifact input is a real dependency.** `inputs = { source = "raw/customers" }`
   gives `load_customers` the resolved `Path` *and* an edge to whichever node
   writes that artifact. No value crosses the IO manager; the ordering is real.
@@ -24,10 +25,13 @@ contains a path or a table name.
 - **Writing is verified.** A node that declares a file artifact as an output but
   doesn't write it fails loudly at the end of the step, rather than materializing
   an asset that isn't there.
-- **The database file is an artifact too.** `db/warehouse` is declared as a `file`
-  artifact that no node lists as an input; nodes resolve it directly with
-  `ctx.artifact("db/warehouse")`. That keeps the database path in the map rather
-  than in a variable or a constant.
+- **A table artifact says which database it is in.** `database = "db/warehouse"`
+  is required and must name a declared `file` artifact — `dagnet check` verifies
+  both. That keeps the database path in the map rather than in a variable or a
+  constant, which is the whole reason `[artifacts]` exists.
+- **`store_root` is declared.** `[pipeline] store_root = "build"` puts every file
+  artifact under `build/`, resolved relative to this manifest. `--store-root`
+  overrides it, which is how the test suite runs this sample into a temp dir.
 
 ## Run it
 
@@ -41,8 +45,15 @@ uv run dagnet graph    # files render as tilted boxes, tables as cylinders
 Afterwards, `build/` holds `raw/customers.json`, `raw/orders.json` and
 `warehouse.duckdb`. Re-running is idempotent (`CREATE OR REPLACE TABLE`).
 
-## Why `after = ["load_customers"]` on `load_orders`
+## Mutual exclusion is a pool, not an ordering
 
-Both loaders open the same DuckDB file for writing, and DuckDB takes an exclusive
-lock. They have no data dependency, so `after` is exactly the right tool: order
-without a value. A concurrency pool would work too — see sample 04.
+Both loaders open the same DuckDB file for writing and DuckDB takes an exclusive
+lock, so they must not run *at the same time*. But there is no reason one has to
+come before the other — they are unordered, merely exclusive.
+
+`[pools] duckdb_writer = 1` says exactly that, and nothing more. Writing
+`after = ["load_customers"]` on `load_orders` would also work, but it would assert
+an ordering the pipeline does not actually have — the same slow drift that left
+netrun graphs carrying edges whose only payload was the string `"done"`. Use
+`after` when B genuinely must follow A; use a pool when they merely must not
+overlap.

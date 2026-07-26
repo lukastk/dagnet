@@ -30,9 +30,12 @@ CASES = [
     ("05_run_presets", "test_api"),
     ("06_transient_ops", "strict"),
     ("07_checks", "good"),
-    ("07_checks", "bad"),
+    ("07_checks", "noisy"),
     ("08_pull_select", None),
 ]
+
+#: Runs that are *supposed* to fail — a blocking check catching a real violation.
+FAILING_CASES = [("07_checks", "bad")]
 
 IDS = [f"{name}:{run or 'default'}" for name, run in CASES]
 
@@ -83,7 +86,7 @@ def test_the_checks_sample_actually_fails_its_contract_check(on_path, tmp_path):
     """07's whole point: the `bad` run violates the contract and the check says so."""
     on_path("07_checks")
     manifest, runs = sample_paths("07_checks")
-    outcomes = {}
+    outcomes, successes = {}, {}
     for run_name in ("good", "bad"):
         job = build_job(
             str(manifest),
@@ -98,10 +101,13 @@ def test_the_checks_sample_actually_fails_its_contract_check(on_path, tmp_path):
         with dg.DagsterInstance.from_config(str(home)) as instance:
             result = job.execute_in_process(instance=instance, raise_on_error=False)
         outcomes[run_name] = {e.check_name: e.passed for e in result.get_asset_check_evaluations()}
+        successes[run_name] = result.success
 
     assert all(outcomes["good"].values()), outcomes["good"]
     assert outcomes["bad"]["units_are_canonical"] is False
     assert outcomes["bad"]["no_missing_values"] is True
+    # Blocking by default: the violation fails the run and stops what follows.
+    assert successes == {"good": True, "bad": False}
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +123,7 @@ def _clean_sample_side_effects():
 def test_every_sample_directory_is_covered_by_a_case():
     """A new sample must be added to CASES, not silently untested."""
     on_disk = {p.name for p in SAMPLES.iterdir() if p.is_dir() and (p / "pipeline.toml").exists()}
-    assert on_disk == {name for name, _ in CASES}
+    assert on_disk == {name for name, _ in CASES} | {name for name, _ in FAILING_CASES}
 
 
 def test_every_sample_has_a_readme_and_a_self_contained_project():

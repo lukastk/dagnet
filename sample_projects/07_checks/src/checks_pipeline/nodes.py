@@ -9,7 +9,7 @@ MEASUREMENTS = [
 
 
 def extract_measurements(ctx) -> {"measurements": list[dict]}:
-    rows = [dict(row) for row in MEASUREMENTS]
+    rows = [dict(row) for row in MEASUREMENTS[: ctx.vars["rows"]]]
     if ctx.vars["inject_bad_units"]:
         # The exact bug class this sample exists for: an upstream source silently
         # switches units, and every downstream number is wrong by 1000x.

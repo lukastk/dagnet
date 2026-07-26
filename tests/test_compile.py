@@ -242,12 +242,18 @@ def test_ctx_artifact_rejects_an_undeclared_key(project):
     assert "UnknownArtifact" in str(result.all_events)
 
 
-def test_a_duckdb_artifact_resolves_to_its_table_name(project):
+def test_a_duckdb_artifact_resolves_to_a_table_and_its_database(project):
+    """DESIGN §5.4: the database's location is in the map, not in a constant."""
     written = project(
         """
+        [artifacts."db/warehouse"]
+        kind = "file"
+        path = "build/w.duckdb"
+
         [artifacts."db/drugs"]
         kind = "duckdb_table"
         table = "drugs"
+        database = "db/warehouse"
 
         [nodes.load]
         fn = "MOD.load"
@@ -256,7 +262,17 @@ def test_a_duckdb_artifact_resolves_to_its_table_name(project):
         """,
         module="""
         def load(ctx) -> None:
-            assert ctx.artifact("db/drugs") == "drugs"
+            location = ctx.artifact("db/drugs")
+            assert location.table == "drugs", location
+            assert location.database.name == "w.duckdb", location
+            assert location.database.is_absolute(), location
+            # The handle is frozen: resolving a location must not move it.
+            try:
+                location.table = "elsewhere"
+            except Exception as exc:
+                assert type(exc).__name__ == "FrozenInstanceError", exc
+            else:
+                raise AssertionError("TableLocation should be frozen")
         """,
     )
     assert materialize(written).success
@@ -838,3 +854,149 @@ def test_an_op_node_may_consume_an_artifact(project):
     assert result.success, result
     assert keys(result) == ["raw/rows", "sink/total"]
     assert result.output_for_node("sink_graph.sink", "total") == 6
+
+
+# --- blocking vs advisory checks (DESIGN §5.5) -----------------------------
+
+
+CHECKED_MODULE = """
+    def a(ctx):
+        return {"rows": [1, -2, 3]}
+
+    def all_positive(ctx, rows):
+        return {"passed": all(r > 0 for r in rows), "metadata": {"n": len(rows)}}
+"""
+
+
+def test_a_failing_check_blocks_by_default_and_fails_the_run(project):
+    """Exit 0 on a violated schema contract is the silent failure we forbid."""
+    written = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.all_positive"] }
+        """,
+        module=CHECKED_MODULE,
+    )
+    result = materialize(written)
+    assert not result.success
+    assert [e.passed for e in result.get_asset_check_evaluations()] == [False]
+
+
+def test_an_advisory_check_records_the_failure_and_lets_the_run_finish(project):
+    written = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = [{ fn = "MOD.all_positive", blocking = false }] }
+        """,
+        module=CHECKED_MODULE,
+    )
+    result = materialize(written)
+    assert result.success
+    evaluation = result.get_asset_check_evaluations()[0]
+    assert evaluation.passed is False
+    assert evaluation.severity is dg.AssetCheckSeverity.WARN
+
+
+def test_a_blocking_check_stops_the_assets_downstream_of_it(project):
+    written = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.all_positive"] }
+
+        [nodes.b]
+        fn = "MOD.b"
+        inputs = { rows = "a.rows" }
+        outputs = ["total"]
+        """,
+        module=CHECKED_MODULE
+        + """
+    def b(ctx, rows):
+        return {"total": sum(rows)}
+""",
+    )
+    result = materialize(written)
+    assert not result.success
+    assert keys(result) == ["a/rows"]
+
+
+def test_a_passing_blocking_check_does_not_disturb_anything(project):
+    written = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.all_positive"] }
+        """,
+        module="""
+        def a(ctx):
+            return {"rows": [1, 2, 3]}
+
+        def all_positive(ctx, rows):
+            return all(r > 0 for r in rows)
+        """,
+    )
+    result = materialize(written)
+    assert result.success
+    assert [e.passed for e in result.get_asset_check_evaluations()] == [True]
+
+
+# --- store_root (DESIGN §5.1) ----------------------------------------------
+
+
+def test_file_artifacts_resolve_under_the_declared_store_root(project, tmp_path):
+    written = project(
+        pipeline='store_root = "build/data"',
+        manifest="""
+        [artifacts."raw/rows"]
+        kind = "file"
+        path = "rows.txt"
+
+        [nodes.write]
+        fn = "MOD.write"
+        outputs = ["rows"]
+        artifacts = { rows = "raw/rows" }
+        """,
+        module="""
+        def write(ctx) -> None:
+            ctx.artifact("raw/rows").write_text("ok")
+        """,
+    )
+    assert materialize(written).success
+    assert (written.root / "build" / "data" / "rows.txt").read_text() == "ok"
+
+
+def test_the_store_root_override_beats_the_manifest_field(project, tmp_path):
+    written = project(
+        pipeline='store_root = "build/data"',
+        manifest="""
+        [artifacts."raw/rows"]
+        kind = "file"
+        path = "rows.txt"
+
+        [nodes.write]
+        fn = "MOD.write"
+        outputs = ["rows"]
+        artifacts = { rows = "raw/rows" }
+        """,
+        module="""
+        def write(ctx) -> None:
+            ctx.artifact("raw/rows").write_text("ok")
+        """,
+    )
+    elsewhere = tmp_path / "elsewhere"
+    job = build_job(
+        str(written.manifest_path), [], store_root=str(elsewhere), executor="in_process"
+    )
+    home = written.root / ".dagster"
+    home.mkdir(exist_ok=True)
+    (home / "dagster.yaml").write_text("{}\n")
+    with dg.DagsterInstance.from_config(str(home)) as instance:
+        assert job.execute_in_process(instance=instance, raise_on_error=False).success
+    assert (elsewhere / "rows.txt").read_text() == "ok"
+    assert not (written.root / "build").exists()

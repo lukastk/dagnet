@@ -2,5 +2,12 @@
 inject_bad_units = false
 
 [runs.bad]
-# Same pipeline, same code — a deliberate contract violation, so the check fails.
+# Same pipeline, same code — a deliberate contract violation. `units_are_canonical`
+# is blocking, so this run FAILS: `aggregate` never runs and the exit code is 1.
 inject_bad_units = true
+
+[runs.noisy]
+# Only the advisory check trips: it is recorded and visible, and the run still
+# succeeds. One row is under the range this check expects.
+inject_bad_units = false
+rows = 1

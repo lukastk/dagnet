@@ -17,7 +17,8 @@ from dagnet import __version__
 from dagnet.check import CheckResult, check
 from dagnet.diagnostics import DagnetError
 from dagnet.graph import PipelineGraph
-from dagnet.instance import dagster_home, open_instance, pool_granularity_is_op, sync_pools
+from dagnet.instance import open_instance, pool_granularity_is_op, sync_pools
+from dagnet.locations import dagster_home
 from dagnet.mermaid import to_mermaid
 
 #: Where a project's map file is looked for when `--manifest` isn't given.

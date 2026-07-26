@@ -8,28 +8,55 @@ resolved location of any declared artifact, and the run name.
 from __future__ import annotations
 
 import difflib
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from dagnet.diagnostics import DagnetError
-from dagnet.schema import Artifact, DuckDBTableArtifact, FileArtifact, Scalar
+from dagnet.schema import DuckDBTableArtifact, FileArtifact, Manifest, Scalar
 
-#: What `ctx.artifact(key)` hands back: a filesystem path, or a table name.
-ArtifactLocation = Path | str
+
+@dataclass(frozen=True)
+class TableLocation:
+    """Where a `duckdb_table` artifact lives: a table, in a particular database.
+
+    Frozen, because a node resolving a location must not be able to move it.
+    """
+
+    table: str
+    database: Path
+
+    def __str__(self) -> str:
+        return f"{self.database}:{self.table}"
+
+
+#: What `ctx.artifact(key)` hands back — a filesystem path, or a table handle.
+ArtifactLocation = Path | TableLocation
 
 
 class UnknownArtifact(DagnetError):
     """`ctx.artifact()` was called with a key the manifest does not declare."""
 
 
-def resolve_artifact(artifact: Artifact, store_root: Path) -> ArtifactLocation:
-    """Turn a declared artifact into the location its node will read or write."""
-    if isinstance(artifact, FileArtifact):
-        return store_root / artifact.path
-    if isinstance(artifact, DuckDBTableArtifact):
-        return artifact.table
-    raise AssertionError(f"unhandled artifact kind: {type(artifact).__name__}")
+def resolve_artifacts(manifest: Manifest, store_root: Path) -> dict[str, ArtifactLocation]:
+    """Resolve every declared artifact to the location its nodes read or write.
+
+    Files resolve first, because a table artifact's `database` names one of them.
+    A `database` that doesn't resolve is a `check` error, so by the time this runs
+    the reference is known good.
+    """
+    locations: dict[str, ArtifactLocation] = {
+        key: store_root / artifact.path
+        for key, artifact in manifest.artifacts.items()
+        if isinstance(artifact, FileArtifact)
+    }
+    for key, artifact in manifest.artifacts.items():
+        if isinstance(artifact, DuckDBTableArtifact):
+            locations[key] = TableLocation(
+                table=artifact.table, database=locations[artifact.database]
+            )
+    return locations
 
 
 class NodeContext:

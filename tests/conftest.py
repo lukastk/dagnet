@@ -46,13 +46,22 @@ def project(tmp_path, monkeypatch):
     """
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    def _project(manifest: str, module: str | None = None, runs: str | None = None) -> Project:
+    def _project(
+        manifest: str,
+        module: str | None = None,
+        runs: str | None = None,
+        pipeline: str = "",
+    ) -> Project:
+        """`pipeline` adds extra keys to the generated `[pipeline]` table."""
         suffix = next(_IDS)
         name = f"nodes_{suffix}"
         if module is not None:
             (tmp_path / f"{name}.py").write_text(textwrap.dedent(module))
+        header = MANIFEST_HEADER
+        if pipeline:
+            header = f'[pipeline]\nname = "p"\n{textwrap.dedent(pipeline).strip()}\n\n'
         manifest_path = tmp_path / f"pipeline_{suffix}.toml"
-        manifest_path.write_text(MANIFEST_HEADER + textwrap.dedent(manifest).replace("MOD", name))
+        manifest_path.write_text(header + textwrap.dedent(manifest).replace("MOD", name))
         runs_paths = []
         if runs is not None:
             runs_path = tmp_path / f"runs_{suffix}.toml"

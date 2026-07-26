@@ -41,8 +41,10 @@ class Pipeline(Base):
     name: str
     description: str = ""
     #: Where Dagster keeps instance state. Resolved relative to the manifest file
-    #: by `Manifest.dagster_home_path`; a `--dagster-home` flag overrides it.
+    #: by `locations.dagster_home`; a `--dagster-home` flag overrides it.
     dagster_home: str = ".dagster"
+    #: Where file artifacts resolve. Same resolution rule; `--store-root` overrides.
+    store_root: str = "."
 
 
 class VarDecl(Base):
@@ -69,9 +71,15 @@ class FileArtifact(Base, tag="file", tag_field="kind"):
 
 
 class DuckDBTableArtifact(Base, tag="duckdb_table", tag_field="kind"):
-    """`kind = "duckdb_table"` — a table in a DuckDB database (DESIGN §5.4)."""
+    """`kind = "duckdb_table"` — a table in a DuckDB database (DESIGN §5.4).
+
+    `database` is required and names a declared `file`-kind artifact, so the
+    database's location is in the map too rather than in a variable or a
+    constant — the whole point of the `[artifacts]` section.
+    """
 
     table: str
+    database: str
     description: str = ""
 
 
@@ -83,6 +91,29 @@ class Retries(Base):
 
     max: int
     wait_s: float = 0.0
+
+
+class CheckDecl(Base):
+    """The long form of a `checks` entry: `{ fn = "...", blocking = false }`.
+
+    A check blocks by default: a violated contract must fail the run rather than
+    being recorded and exited-zero over. `blocking = false` makes one advisory —
+    still executed, still recorded and visible, but the run continues.
+    """
+
+    fn: str
+    blocking: bool = True
+
+
+#: A `checks` entry is a bare import path (blocking) or the long form above.
+CheckEntry = Union[str, CheckDecl]
+
+
+def as_check_decl(entry: CheckEntry) -> CheckDecl:
+    """Normalise either form of a `checks` entry to the long one."""
+    if isinstance(entry, str):
+        return CheckDecl(fn=entry)
+    return entry
 
 
 class Node(Base):
@@ -100,8 +131,8 @@ class Node(Base):
     after: list[str] = []
     pool: str | None = None
     retries: Retries | None = None
-    #: output name -> import paths of asset-check functions.
-    checks: dict[str, list[str]] = {}
+    #: output name -> check declarations, each a bare import path or a long form.
+    checks: dict[str, list[CheckEntry]] = {}
     #: False makes the outputs transient ops folded into a downstream asset.
     asset: bool = True
     group: str | None = None

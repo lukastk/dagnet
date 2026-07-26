@@ -39,13 +39,14 @@ import dagster as dg
 from msgspec import UNSET
 
 from dagnet.check import CheckResult, check
-from dagnet.context import ArtifactLocation, NodeContext, resolve_artifact
+from dagnet.context import ArtifactLocation, NodeContext, resolve_artifacts
 from dagnet.diagnostics import DagnetError
 from dagnet.graph import ArtifactRef, NodeRef, PipelineGraph, asset_key
+from dagnet.locations import store_root as resolve_store_root
 from dagnet.nodefn import NodeFunction, describe, import_object
 from dagnet.partition import Cluster, config_path, partition
 from dagnet.runs import declaration_for, resolve_run
-from dagnet.schema import Manifest, Node
+from dagnet.schema import CheckDecl, Manifest, Node, as_check_decl
 
 #: The resource key carrying run-wide information into every node.
 RESOURCE_KEY = "dagnet"
@@ -104,8 +105,8 @@ def compile_definitions(
     """Turn a passed `CheckResult` into `Definitions`, with one job per run preset."""
     manifest = result.manifest
     graph = result.graph
-    root = Path(store_root) if store_root is not None else manifest_path.parent
-    artifacts = {key: resolve_artifact(art, root) for key, art in manifest.artifacts.items()}
+    override = str(store_root) if store_root is not None else None
+    artifacts = resolve_artifacts(manifest, resolve_store_root(manifest, manifest_path, override))
 
     clusters = partition(manifest, graph)
     _reject_name_collisions(manifest, clusters)
@@ -634,11 +635,15 @@ def _compile_checks(
 ) -> list[dg.AssetChecksDefinition]:
     node = manifest.nodes[node_name]
     built: list[dg.AssetChecksDefinition] = []
-    for output, paths in node.checks.items():
+    for output, entries in node.checks.items():
         key = dg.AssetKey(list(asset_key(manifest, node_name, output)))
         bound = node.artifacts.get(output)
-        for path in paths:
-            built.append(_compile_check(manifest, node_name, output, key, path, bound, artifacts))
+        for entry in entries:
+            built.append(
+                _compile_check(
+                    manifest, node_name, output, key, as_check_decl(entry), bound, artifacts
+                )
+            )
     return built
 
 
@@ -647,12 +652,20 @@ def _compile_check(
     node_name: str,
     output: str,
     key: dg.AssetKey,
-    path: str,
+    decl: CheckDecl,
     bound: str | None,
     artifacts: dict[str, ArtifactLocation],
 ) -> dg.AssetChecksDefinition:
-    fn = _must_import(path)
-    name = path.rpartition(".")[2]
+    """One check function, as a Dagster asset check.
+
+    A check blocks by default (DESIGN §5.5): `blocking=True` plus ERROR severity
+    makes a failure stop downstream assets and fail the run, so a violated schema
+    contract cannot exit zero. `blocking = false` in the manifest makes it
+    advisory — WARN severity, recorded and visible, run continues.
+    """
+    fn = _must_import(decl.fn)
+    name = decl.fn.rpartition(".")[2]
+    severity = dg.AssetCheckSeverity.ERROR if decl.blocking else dg.AssetCheckSeverity.WARN
 
     def run_check(context: dg.AssetCheckExecutionContext, **kwargs: Any) -> dg.AssetCheckResult:
         ctx = NodeContext(
@@ -663,7 +676,7 @@ def _compile_check(
         # A value output arrives loaded through the IO manager; an artifact-bound
         # output has no value, so the check gets its location instead.
         subject = ctx.artifact(bound) if bound is not None else next(iter(kwargs.values()))
-        return _as_check_result(name, fn(ctx, subject))
+        return _as_check_result(name, fn(ctx, subject), severity)
 
     run_check.__name__ = name
     params = [inspect.Parameter("context", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
@@ -674,19 +687,24 @@ def _compile_check(
     return dg.asset_check(
         asset=key,
         name=name,
-        description=f"{path} on {node_name}.{output}",
+        description=f"{decl.fn} on {node_name}.{output}",
+        blocking=decl.blocking,
         required_resource_keys={RESOURCE_KEY},
         config_schema=_config_schema(manifest, node_name) or None,
     )(run_check)
 
 
-def _as_check_result(name: str, returned: Any) -> dg.AssetCheckResult:
+def _as_check_result(
+    name: str, returned: Any, severity: dg.AssetCheckSeverity
+) -> dg.AssetCheckResult:
     """A check returns a bool, or a dict with `passed` and optional `metadata`."""
     if isinstance(returned, bool):
-        return dg.AssetCheckResult(passed=returned)
+        return dg.AssetCheckResult(passed=returned, severity=severity)
     if isinstance(returned, dict) and isinstance(returned.get("passed"), bool):
         return dg.AssetCheckResult(
-            passed=returned["passed"], metadata=returned.get("metadata") or {}
+            passed=returned["passed"],
+            severity=severity,
+            metadata=returned.get("metadata") or {},
         )
     raise CheckReturnError(
         f"check '{name}' must return a bool or {{'passed': bool, 'metadata': {{...}}}}, "

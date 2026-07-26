@@ -34,9 +34,14 @@ sample_n = { type = "int", default = 1000 }
 kind = "file"
 path = "extracted/openfda_drug_ndc.json"
 
+[artifacts."db/warehouse"]
+kind = "file"
+path = "w.duckdb"
+
 [artifacts."db/drugs"]
 kind = "duckdb_table"
 table = "drugs"
+database = "db/warehouse"
 
 [nodes.rerank_candidates]
 fn = "ai_index.nodes.rerank_candidates.main"

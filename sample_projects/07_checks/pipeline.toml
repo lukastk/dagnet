@@ -5,16 +5,21 @@ description = "Asset checks guarding a schema contract at an artifact boundary."
 [vars]
 # Flip this to make the producer violate the contract on purpose.
 inject_bad_units = { type = "bool", default = false }
+# How many of the sample measurements to emit; below 2 trips the advisory check.
+rows = { type = "int", default = 4 }
 
 [nodes.extract_measurements]
 fn = "checks_pipeline.nodes.extract_measurements"
 outputs = ["measurements"]
-# Checks are declared per output and run after it materializes. Each names an
-# import path to a plain function.
+# Checks are declared per output and run after it materializes. A bare string is
+# the common case: a *blocking* check, whose failure stops everything downstream
+# and fails the run. The long form opts out of that.
 checks = { measurements = [
     "checks_pipeline.checks.units_are_canonical",
     "checks_pipeline.checks.no_missing_values",
-    "checks_pipeline.checks.rows_within_expected_range",
+    # Advisory: a row count outside the usual range is worth seeing in the UI,
+    # but it isn't a contract violation, so it must not stop the pipeline.
+    { fn = "checks_pipeline.checks.rows_within_expected_range", blocking = false },
 ] }
 
 [nodes.aggregate]

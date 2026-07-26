@@ -58,9 +58,14 @@ def test_after_is_a_dotted_edge_because_no_data_flows():
 
 def test_artifacts_are_their_own_boxes_between_producer_and_consumer():
     out = diagram("""
+    [artifacts."db/file"]
+    kind = "file"
+    path = "w.duckdb"
+
     [artifacts."db/drugs"]
     kind = "duckdb_table"
     table = "drugs"
+    database = "db/file"
 
     [artifacts."raw/ndc"]
     kind = "file"

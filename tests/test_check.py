@@ -160,9 +160,14 @@ def test_a_cycle_is_reported_once_with_its_path(project):
 def test_artifact_input_creates_a_dependency_on_its_producer(project):
     result = project(
         """
+        [artifacts."db/file"]
+        kind = "file"
+        path = "w.duckdb"
+
         [artifacts."db/drugs"]
         kind = "duckdb_table"
         table = "drugs"
+        database = "db/file"
 
         [nodes.load]
         fn = "MOD.load"
@@ -202,9 +207,14 @@ def test_consuming_an_artifact_nobody_produces_is_an_error(project):
 
 def test_two_nodes_producing_one_artifact_is_an_error(project):
     result = project("""
+        [artifacts."db/file"]
+        kind = "file"
+        path = "w.duckdb"
+
         [artifacts."db/t"]
         kind = "duckdb_table"
         table = "t"
+        database = "db/file"
 
         [nodes.a]
         fn = "m.a"
@@ -323,9 +333,14 @@ def test_an_op_node_feeding_two_assets_warns_about_the_merge(project):
 
 def test_an_op_node_cannot_have_checks_or_artifacts(project):
     result = project("""
+        [artifacts."db/file"]
+        kind = "file"
+        path = "w.duckdb"
+
         [artifacts."db/t"]
         kind = "duckdb_table"
         table = "t"
+        database = "db/file"
 
         [nodes.src]
         fn = "m.s"
@@ -478,9 +493,14 @@ def test_artifact_bound_outputs_are_excluded_from_the_return_annotation(project)
     """DESIGN §7 rule 2: artifact outputs are written, not returned."""
     result = project(
         """
+        [artifacts."db/file"]
+        kind = "file"
+        path = "w.duckdb"
+
         [artifacts."db/t"]
         kind = "duckdb_table"
         table = "t"
+        database = "db/file"
 
         [nodes.a]
         fn = "MOD.a"
@@ -636,3 +656,82 @@ def test_a_node_local_variable_may_be_overridden_per_node(project):
         runs="[defaults]\nsample_n = 100\n[defaults.a]\nchunk = 8\n[runs.test]\nsample_n = 1\n",
     )
     assert result.ok, result.diagnostics.render()
+
+
+# --- artifact databases (DESIGN §5.4) --------------------------------------
+
+
+def test_a_table_artifact_must_name_a_declared_database(project):
+    result = project("""
+        [artifacts."db/t"]
+        kind = "duckdb_table"
+        table = "t"
+        database = "db/nope"
+
+        [nodes.a]
+        fn = "m.a"
+        outputs = ["t"]
+        artifacts = { t = "db/t" }
+    """)
+    assert "unknown-artifact" in result.diagnostics.codes()
+    assert result.diagnostics.errors[0].location.path == 'artifacts."db/t".database'
+
+
+def test_a_table_artifacts_database_must_be_a_file(project):
+    result = project("""
+        [artifacts."db/one"]
+        kind = "duckdb_table"
+        table = "one"
+        database = "db/two"
+
+        [artifacts."db/two"]
+        kind = "duckdb_table"
+        table = "two"
+        database = "db/one"
+
+        [nodes.a]
+        fn = "m.a"
+        outputs = ["x", "y"]
+        artifacts = { x = "db/one", y = "db/two" }
+    """)
+    assert result.diagnostics.codes().count("database-not-a-file") == 2
+
+
+def test_a_table_artifact_without_a_database_is_a_structural_error(project):
+    result = project("""
+        [artifacts."db/t"]
+        kind = "duckdb_table"
+        table = "t"
+    """)
+    assert result.diagnostics.codes() == ["invalid-value"]
+    assert "database" in result.diagnostics.errors[0].message
+
+
+# --- check declarations, long form (DESIGN §5.5) ---------------------------
+
+
+def test_both_check_forms_are_accepted_and_validated(project):
+    result = project(
+        """
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = [
+            "MOD.short_form",
+            { fn = "MOD.long_form", blocking = false },
+            { fn = "MOD.missing" },
+        ] }
+        """,
+        module="""
+        def a(ctx):
+            return {"rows": [1]}
+
+        def short_form(ctx, rows):
+            return True
+
+        def long_form(ctx, rows):
+            return True
+        """,
+    )
+    assert result.diagnostics.codes() == ["check-missing-attribute"]
+    assert result.diagnostics.errors[0].location.path == "nodes.a.checks.rows[2]"

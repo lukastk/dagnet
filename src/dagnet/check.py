@@ -46,7 +46,7 @@ from dagnet.nodefn import (
     import_object,
 )
 from dagnet.runs import validate_runs
-from dagnet.schema import Manifest
+from dagnet.schema import DuckDBTableArtifact, FileArtifact, Manifest, as_check_decl
 
 #: The parameter every node function takes first (DESIGN §7 rule 1).
 CTX_PARAMETER = "ctx"
@@ -245,7 +245,7 @@ def _check_artifact_bindings(
                     hint=_closest(key, manifest.artifacts),
                 )
 
-        for output, paths in node.checks.items():
+        for output in node.checks:
             if output not in node.outputs:
                 diags.error(
                     "unknown-output",
@@ -255,6 +255,8 @@ def _check_artifact_bindings(
                     hint=_closest(output, node.outputs),
                 )
 
+    _check_artifact_databases(manifest, root, diags)
+
     for key, producers in graph.artifact_producers.items():
         if len(producers) > 1:
             where = ", ".join(f"{n}.{o}" for n, o in sorted(producers))
@@ -263,6 +265,32 @@ def _check_artifact_bindings(
                 f"artifact '{key}' is produced by more than one output: {where}",
                 root.child("artifacts", key),
                 hint="an artifact has exactly one producer",
+            )
+
+
+def _check_artifact_databases(manifest: Manifest, root: Location, diags: Diagnostics) -> None:
+    """A table artifact's `database` must name a declared *file* artifact (§5.4)."""
+    files = [k for k, a in manifest.artifacts.items() if isinstance(a, FileArtifact)]
+    for key, artifact in manifest.artifacts.items():
+        if not isinstance(artifact, DuckDBTableArtifact):
+            continue
+        loc = root.child("artifacts", key, "database")
+        target = manifest.artifacts.get(artifact.database)
+        if target is None:
+            diags.error(
+                "unknown-artifact",
+                f"artifact '{key}' names database '{artifact.database}', "
+                f"which is not declared in [artifacts]",
+                loc,
+                hint=_closest(artifact.database, files),
+            )
+        elif not isinstance(target, FileArtifact):
+            diags.error(
+                "database-not-a-file",
+                f"artifact '{key}' names database '{artifact.database}', which is a "
+                f"{target.__struct_config__.tag} artifact, not a file",
+                loc,
+                hint='a DuckDB database is a file on disk; declare it with kind = "file"',
             )
 
 
@@ -454,8 +482,9 @@ def _check_functions(
             functions[node_name] = described
             _check_signature(node_name, node, described, root, diags)
 
-        for output, paths in node.checks.items():
-            for index, path in enumerate(paths):
+        for output, entries in node.checks.items():
+            for index, entry in enumerate(entries):
+                path = as_check_decl(entry).fn
                 check_loc = root.child("nodes", node_name, "checks", output).child(index)
                 result = import_object(path)
                 if isinstance(result, ImportFailure):

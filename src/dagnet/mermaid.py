@@ -58,7 +58,8 @@ def _artifact_nodes(manifest: Manifest) -> list[str]:
         if isinstance(artifact, FileArtifact):
             lines.append(f'    {_artifact_id(key)}[/"{key}<br/><small>{artifact.path}</small>"/]')
         elif isinstance(artifact, DuckDBTableArtifact):
-            lines.append(f'    {_artifact_id(key)}[("{key}<br/><small>{artifact.table}</small>")]')
+            label = f"{key}<br/><small>{artifact.database}:{artifact.table}</small>"
+            lines.append(f'    {_artifact_id(key)}[("{label}")]')
     return lines
 
 

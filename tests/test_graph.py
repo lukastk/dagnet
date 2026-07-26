@@ -43,7 +43,10 @@ def test_resolves_a_node_output_reference():
 
 
 def test_resolves_an_artifact_reference():
-    m = manifest('[artifacts."db/drugs"]\nkind = "duckdb_table"\ntable = "drugs"\n')
+    m = manifest(
+        '[artifacts."db/file"]\nkind = "file"\npath = "w.duckdb"\n'
+        '[artifacts."db/drugs"]\nkind = "duckdb_table"\ntable = "drugs"\ndatabase = "db/file"\n'
+    )
     assert resolve_reference(m, "db/drugs") == ArtifactRef("db/drugs")
 
 
@@ -90,9 +93,14 @@ def test_asset_key_is_node_slash_output_by_default():
 
 def test_an_artifact_bound_output_takes_the_artifact_key():
     m = manifest("""
+[artifacts."db/file"]
+kind = "file"
+path = "w.duckdb"
+
 [artifacts."db/drugs"]
 kind = "duckdb_table"
 table = "drugs"
+database = "db/file"
 
 [nodes.load_drugs]
 fn = "m.load"

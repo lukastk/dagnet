@@ -1,4 +1,7 @@
-"""Where Dagster keeps its state, and getting the manifest's pools onto it.
+"""Setting up the Dagster instance, and getting the manifest's pools onto it.
+
+(Where the instance *lives* is `locations.dagster_home` — that is a
+manifest-declared path, not an instance concern.)
 
 Two findings from the spikes shape this module (`_dev/experiments/FINDINGS.md`):
 
@@ -19,21 +22,9 @@ from typing import Iterator
 
 import dagster as dg
 
-from dagnet.schema import Manifest
-
 #: Written when a DAGSTER_HOME has no config yet. `granularity: op` is what makes
 #: a pool limit apply per step rather than per run.
 DEFAULT_INSTANCE_CONFIG = "concurrency:\n  pools:\n    granularity: op\n"
-
-
-def dagster_home(manifest: Manifest, manifest_path: Path, override: str | None = None) -> Path:
-    """DESIGN §5.1: `dagster_home` is resolved relative to the manifest file."""
-    if override is not None:
-        return Path(override).expanduser().resolve()
-    declared = Path(manifest.pipeline.dagster_home).expanduser()
-    if declared.is_absolute():
-        return declared
-    return (manifest_path.parent / declared).resolve()
 
 
 def prepare_home(home: Path) -> None:

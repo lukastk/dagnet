@@ -25,8 +25,9 @@ def no_missing_values(ctx, measurements: list[dict]) -> bool:
 
 
 def rows_within_expected_range(ctx, measurements: list[dict]):
+    """Advisory: an unusual row count is worth seeing, but isn't a contract breach."""
     n = len(measurements)
-    return {"passed": 1 <= n <= 10_000, "metadata": {"rows": n}}
+    return {"passed": 2 <= n <= 10_000, "metadata": {"rows": n}}
 
 
 def totals_are_positive(ctx, by_analyte: dict):
