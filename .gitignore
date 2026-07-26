@@ -6,4 +6,5 @@ __pycache__/
 .pytest_cache/
 dist/
 *.egg-info/
-uv.lock
+# The root uv.lock is committed; the samples' are churn (they pin dagnet by path).
+sample_projects/*/uv.lock

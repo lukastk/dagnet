@@ -623,3 +623,218 @@ def test_selecting_a_single_leaf_runs_only_its_chain(project):
     result = materialize(written, select="a/out")
     assert result.success, result
     assert keys(result) == ["a/out"]
+
+
+# --- asset = false: op-nodes folded into graph-backed assets ---------------
+
+
+def test_an_op_node_becomes_a_step_inside_the_downstream_asset(project):
+    written = project(
+        """
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["rows"]
+
+        [nodes.doubled]
+        fn = "MOD.double"
+        inputs = { rows = "src.rows" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.sink"
+        inputs = { values = "doubled.out" }
+        outputs = ["total"]
+        """,
+        module="""
+        def src(ctx):
+            return {"rows": [1, 2, 3]}
+
+        def double(ctx, rows):
+            return {"out": [r * 2 for r in rows]}
+
+        def sink(ctx, values):
+            return {"total": sum(values)}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    # The op-node has no asset identity, and its step is nested in the graph.
+    assert keys(result) == ["sink/total", "src/rows"]
+    steps = sorted({e.step_key for e in result.all_events if e.event_type_value == "STEP_START"})
+    assert steps == ["sink_graph.doubled", "sink_graph.sink", "src"]
+    assert result.output_for_node("sink_graph.sink", "total") == 12
+
+
+def test_a_chain_of_op_nodes_all_runs_inside_one_graph(project):
+    written = project(
+        """
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["rows"]
+
+        [nodes.a]
+        fn = "MOD.step"
+        inputs = { rows = "src.rows" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.b]
+        fn = "MOD.step"
+        inputs = { rows = "a.out" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.sink"
+        inputs = { rows = "b.out" }
+        outputs = ["total"]
+        """,
+        module="""
+        def src(ctx):
+            return {"rows": [1, 2, 3]}
+
+        def step(ctx, rows):
+            return {"out": [r + 1 for r in rows]}
+
+        def sink(ctx, rows):
+            return {"total": sum(rows)}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert keys(result) == ["sink/total", "src/rows"]
+    assert result.output_for_node("sink_graph.sink", "total") == 12
+
+
+def test_an_op_node_feeding_two_assets_merges_them_into_one_multi_asset(project):
+    written = project(
+        """
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["rows"]
+
+        [nodes.shared]
+        fn = "MOD.shared"
+        inputs = { rows = "src.rows" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.left]
+        fn = "MOD.total"
+        inputs = { rows = "shared.out" }
+        outputs = ["value"]
+
+        [nodes.right]
+        fn = "MOD.count"
+        inputs = { rows = "shared.out" }
+        outputs = ["value"]
+        """,
+        module="""
+        def src(ctx):
+            return {"rows": [1, 2, 3]}
+
+        def shared(ctx, rows):
+            return {"out": [r * 10 for r in rows]}
+
+        def total(ctx, rows):
+            return {"value": sum(rows)}
+
+        def count(ctx, rows):
+            return {"value": len(rows)}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert keys(result) == ["left/value", "right/value", "src/rows"]
+    assert result.output_for_node("left_right_graph.left", "value") == 60
+    assert result.output_for_node("left_right_graph.right", "value") == 3
+
+
+def test_an_op_node_can_carry_after_and_variables(project):
+    written = project(
+        """
+        [vars]
+        factor = { type = "int", default = 2 }
+
+        [nodes.gate]
+        fn = "MOD.gate"
+        outputs = ["ok"]
+
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["rows"]
+
+        [nodes.scaled]
+        fn = "MOD.scale"
+        inputs = { rows = "src.rows" }
+        outputs = ["out"]
+        after = ["gate"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.sink"
+        inputs = { rows = "scaled.out" }
+        outputs = ["total"]
+        """,
+        module="""
+        def gate(ctx):
+            return {"ok": True}
+
+        def src(ctx):
+            return {"rows": [1, 2, 3]}
+
+        def scale(ctx, rows):
+            return {"out": [r * ctx.vars["factor"] for r in rows]}
+
+        def sink(ctx, rows):
+            return {"total": sum(rows)}
+        """,
+        runs="[runs.big]\nfactor = 10\n",
+    )
+    result = materialize(written, run_name="big")
+    assert result.success, result
+    # The run preset reached a node nested one level down in the config tree.
+    assert result.output_for_node("sink_graph.sink", "total") == 60
+    steps = {e.step_key for e in result.all_events if e.event_type_value == "STEP_START"}
+    assert "gate" in steps and "sink_graph.scaled" in steps
+
+
+def test_an_op_node_may_consume_an_artifact(project):
+    written = project(
+        """
+        [artifacts."raw/rows"]
+        kind = "file"
+        path = "raw/rows.txt"
+
+        [nodes.extract]
+        fn = "MOD.extract"
+        outputs = ["rows"]
+        artifacts = { rows = "raw/rows" }
+
+        [nodes.parsed]
+        fn = "MOD.parse"
+        inputs = { path = "raw/rows" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.sink"
+        inputs = { rows = "parsed.out" }
+        outputs = ["total"]
+        """,
+        module="""
+        def extract(ctx) -> None:
+            ctx.artifact("raw/rows").write_text("1\\n2\\n3\\n")
+
+        def parse(ctx, path):
+            return {"out": [int(line) for line in path.read_text().split()]}
+
+        def sink(ctx, rows):
+            return {"total": sum(rows)}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert keys(result) == ["raw/rows", "sink/total"]
+    assert result.output_for_node("sink_graph.sink", "total") == 6

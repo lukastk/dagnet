@@ -1,0 +1,34 @@
+[pipeline]
+name = "transient_ops"
+description = "Small intermediate steps that get folded into the asset they feed."
+
+[vars]
+threshold = { type = "float", default = 0.0 }
+
+[nodes.load_readings]
+fn = "transient_pipeline.nodes.load_readings"
+description = "The durable starting point: a real asset with its own history."
+outputs = ["readings"]
+
+# --- transient plumbing: no catalog entry, no checks, not --select-able ---
+
+[nodes.drop_nulls]
+fn = "transient_pipeline.nodes.drop_nulls"
+description = "Two lines of cleanup nothing needs to resume from."
+inputs = { readings = "load_readings.readings" }
+outputs = ["kept"]
+asset = false
+
+[nodes.normalise]
+fn = "transient_pipeline.nodes.normalise"
+inputs = { kept = "drop_nulls.kept" }
+outputs = ["scaled"]
+asset = false
+
+# --- back to a durable asset; the two ops above fold into its graph ---
+
+[nodes.report]
+fn = "transient_pipeline.nodes.report"
+description = "The durable result."
+inputs = { scaled = "normalise.scaled" }
+outputs = ["summary"]

@@ -1,0 +1,5 @@
+[defaults]
+threshold = 0.0
+
+[runs.strict]
+threshold = 2.0

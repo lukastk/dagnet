@@ -41,8 +41,9 @@ from msgspec import UNSET
 from dagnet.check import CheckResult, check
 from dagnet.context import ArtifactLocation, NodeContext, resolve_artifact
 from dagnet.diagnostics import DagnetError
-from dagnet.graph import NodeRef, PipelineGraph, asset_key
+from dagnet.graph import ArtifactRef, NodeRef, PipelineGraph, asset_key
 from dagnet.nodefn import NodeFunction, describe, import_object
+from dagnet.partition import Cluster, config_path, partition
 from dagnet.runs import declaration_for, resolve_run
 from dagnet.schema import Manifest, Node
 
@@ -106,16 +107,20 @@ def compile_definitions(
     root = Path(store_root) if store_root is not None else manifest_path.parent
     artifacts = {key: resolve_artifact(art, root) for key, art in manifest.artifacts.items()}
 
+    clusters = partition(manifest, graph)
+    _reject_name_collisions(manifest, clusters)
+
     assets: list[dg.AssetsDefinition] = []
     checks: list[dg.AssetChecksDefinition] = []
-    for node_name in sorted(manifest.nodes):
-        node = manifest.nodes[node_name]
-        if not node.asset:
-            raise CompileError(
-                f"node '{node_name}' sets `asset = false`, which the compiler does not support yet"
+    for cluster in clusters:
+        if cluster.is_graph_backed:
+            assets.append(_compile_cluster(manifest, graph, cluster, result.functions, artifacts))
+        else:
+            assets.append(
+                _compile_node(manifest, graph, cluster.assets[0], result.functions, artifacts)
             )
-        assets.append(_compile_node(manifest, graph, node_name, result.functions, artifacts))
-        checks.extend(_compile_checks(manifest, node_name, artifacts))
+        for node_name in cluster.assets:
+            checks.extend(_compile_checks(manifest, node_name, artifacts))
 
     preset_names = sorted(result.runs.runs) if result.runs is not None else []
     jobs = [_compile_run_job(manifest, result, name, executor) for name in preset_names]
@@ -195,6 +200,283 @@ def _compile_node(
     )(compute)
 
 
+# --- clusters that fold in `asset = false` nodes ---------------------------
+
+
+def _reject_name_collisions(manifest: Manifest, clusters: list[Cluster]) -> None:
+    for cluster in clusters:
+        if cluster.is_graph_backed and cluster.name in manifest.nodes:
+            raise CompileError(
+                f"the graph generated for {', '.join(cluster.assets)} would be called "
+                f"'{cluster.name}', which is also a node name; rename that node"
+            )
+
+
+def _compile_cluster(
+    manifest: Manifest,
+    graph: PipelineGraph,
+    cluster: Cluster,
+    functions: dict[str, NodeFunction],
+    artifacts: dict[str, ArtifactLocation],
+) -> dg.AssetsDefinition:
+    """Build the graph-backed asset for a cluster with op-nodes folded in.
+
+    Ordering-only dependencies can't be expressed with `deps=` here — `from_graph`
+    has no such parameter — so they arrive as `Nothing`-typed graph inputs mapped
+    to the upstream asset key, which is the same thing by another route.
+    """
+    inside = set(cluster.members)
+    # External dependencies, deduplicated by asset key so two ops consuming the
+    # same upstream asset share one graph input.
+    value_inputs: dict[tuple[str, ...], str] = {}
+    ordering_inputs: dict[tuple[str, ...], str] = {}
+
+    for member in cluster.members:
+        node = manifest.nodes[member]
+        for param in node.inputs:
+            ref = graph.references[member][param]
+            if isinstance(ref, NodeRef):
+                if ref.node in inside:
+                    continue
+                key = asset_key(manifest, ref.node, ref.output)
+                value_inputs.setdefault(key, _graph_input_name("in", key))
+            else:
+                producer = graph.producer_of(ref)
+                if producer is None or producer in inside:
+                    continue
+                for key in _keys_of(manifest, producer):
+                    ordering_inputs.setdefault(key, _graph_input_name("dep", key))
+        for target in node.after:
+            if target in inside:
+                continue
+            for key in _keys_of(manifest, target):
+                ordering_inputs.setdefault(key, _graph_input_name("dep", key))
+
+    ops = {
+        member: _compile_op(manifest, graph, member, cluster, functions, artifacts, value_inputs)
+        for member in cluster.members
+    }
+
+    graph_outs = {
+        _graph_output_name(node_name, output): dg.GraphOut()
+        for node_name in cluster.assets
+        for output in manifest.nodes[node_name].outputs
+    }
+    body = _compile_graph_body(manifest, graph, cluster, ops, value_inputs, ordering_inputs, inside)
+    graph_def = dg.graph(name=cluster.name, out=graph_outs)(body)
+
+    keys_by_input_name = {
+        name: dg.AssetKey(list(key))
+        for key, name in list(value_inputs.items()) + list(ordering_inputs.items())
+    }
+    keys_by_output_name = {
+        _graph_output_name(node_name, output): dg.AssetKey(
+            list(asset_key(manifest, node_name, output))
+        )
+        for node_name in cluster.assets
+        for output in manifest.nodes[node_name].outputs
+    }
+    groups = {node.group for node in (manifest.nodes[n] for n in cluster.assets)}
+    return dg.AssetsDefinition.from_graph(
+        graph_def,
+        keys_by_input_name=keys_by_input_name,
+        keys_by_output_name=keys_by_output_name,
+        group_name=groups.pop() if len(groups) == 1 else None,
+        # A graph-backed asset cannot subset: its body wires a fixed topology, so
+        # every output is produced together. Selecting one output of such a node
+        # pulls all of them.
+        can_subset=False,
+    )
+
+
+def _compile_op(
+    manifest: Manifest,
+    graph: PipelineGraph,
+    node_name: str,
+    cluster: Cluster,
+    functions: dict[str, NodeFunction],
+    artifacts: dict[str, ArtifactLocation],
+    value_inputs: dict[tuple[str, ...], str],
+) -> dg.OpDefinition:
+    """One member of a cluster, as an op rather than an asset."""
+    node = manifest.nodes[node_name]
+    described = functions.get(node_name) or describe(_must_import(node.fn))
+
+    artifact_params = {
+        param: ref.key
+        for param, ref in graph.references[node_name].items()
+        if isinstance(ref, ArtifactRef)
+    }
+    value_params = [p for p in node.inputs if p not in artifact_params]
+    ordering_params = _ordering_params(manifest, graph, node_name, cluster)
+
+    ins: dict[str, dg.In] = {param: dg.In() for param in value_params}
+    ins.update({param: dg.In(dg.Nothing) for param in ordering_params})
+    outs = {
+        output: (dg.Out(dg.Nothing) if output in node.artifacts else dg.Out())
+        for output in node.outputs
+    }
+
+    compute = _compile_op_body(manifest, node_name, described, artifacts, artifact_params)
+    # A `Nothing` input carries no value, so Dagster forbids it as a parameter: it
+    # is declared in `ins` and supplied only when the op is invoked in the graph.
+    compute.__signature__ = inspect.Signature(
+        [inspect.Parameter("context", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        + [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD) for p in value_params]
+    )
+    return dg.op(
+        name=node_name,
+        ins=ins,
+        out=outs,
+        description=node.description or None,
+        pool=node.pool,
+        retry_policy=_retry_policy(node),
+        config_schema=_config_schema(manifest, node_name) or None,
+        required_resource_keys={RESOURCE_KEY},
+    )(compute)
+
+
+def _ordering_params(
+    manifest: Manifest, graph: PipelineGraph, node_name: str, cluster: Cluster
+) -> dict[str, tuple[str, str] | tuple[str, ...]]:
+    """The `Nothing` inputs an op needs: `after` targets and artifact producers.
+
+    Maps the generated parameter name to what satisfies it — a `(node, output)`
+    pair when the source is inside the cluster, or an asset key when it is not.
+    """
+    node = manifest.nodes[node_name]
+    inside = set(cluster.members)
+    params: dict[str, tuple[str, str] | tuple[str, ...]] = {}
+
+    def add(target: str) -> None:
+        if target in inside:
+            first_output = manifest.nodes[target].outputs[0]
+            params[f"_after_{target}"] = (target, first_output)
+        else:
+            for key in _keys_of(manifest, target):
+                params[_graph_input_name("dep", key)] = key
+
+    for param, ref in graph.references[node_name].items():
+        if isinstance(ref, ArtifactRef):
+            producer = graph.producer_of(ref)
+            if producer is not None and producer != node_name:
+                add(producer)
+    for target in node.after:
+        if target in manifest.nodes:
+            add(target)
+    return params
+
+
+def _compile_graph_body(
+    manifest: Manifest,
+    graph: PipelineGraph,
+    cluster: Cluster,
+    ops: dict[str, dg.OpDefinition],
+    value_inputs: dict[tuple[str, ...], str],
+    ordering_inputs: dict[tuple[str, ...], str],
+    inside: set[str],
+) -> Callable[..., Any]:
+    """A closure that invokes each op in topological order and wires the handles."""
+    input_names = list(value_inputs.values()) + list(ordering_inputs.values())
+
+    def body(**graph_inputs: Any) -> Any:
+        produced: dict[tuple[str, str], Any] = {}
+        for member in cluster.members:
+            node = manifest.nodes[member]
+            kwargs: dict[str, Any] = {}
+            for param in node.inputs:
+                ref = graph.references[member][param]
+                if not isinstance(ref, NodeRef):
+                    continue  # artifact inputs are injected inside the op body
+                if ref.node in inside:
+                    kwargs[param] = produced[(ref.node, ref.output)]
+                else:
+                    key = asset_key(manifest, ref.node, ref.output)
+                    kwargs[param] = graph_inputs[value_inputs[key]]
+            for param, source in _ordering_params(manifest, graph, member, cluster).items():
+                if param.startswith("_after_"):
+                    kwargs[param] = produced[source]
+                else:
+                    kwargs[param] = graph_inputs[ordering_inputs[source]]
+
+            handles = ops[member](**kwargs)
+            outputs = node.outputs
+            if len(outputs) == 1:
+                produced[(member, outputs[0])] = handles
+            else:
+                for output, handle in zip(outputs, handles):
+                    produced[(member, output)] = handle
+
+        return {
+            _graph_output_name(node_name, output): produced[(node_name, output)]
+            for node_name in cluster.assets
+            for output in manifest.nodes[node_name].outputs
+        }
+
+    body.__name__ = cluster.name
+    body.__signature__ = inspect.Signature(
+        [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD) for name in input_names]
+    )
+    return body
+
+
+def _keys_of(manifest: Manifest, node_name: str) -> list[tuple[str, ...]]:
+    return [asset_key(manifest, node_name, output) for output in manifest.nodes[node_name].outputs]
+
+
+def _graph_input_name(prefix: str, key: tuple[str, ...]) -> str:
+    return f"{prefix}_{'__'.join(key)}"
+
+
+def _graph_output_name(node_name: str, output: str) -> str:
+    return f"{node_name}__{output}"
+
+
+def _invoke_node(
+    manifest: Manifest,
+    node_name: str,
+    described: NodeFunction,
+    artifacts: dict[str, ArtifactLocation],
+    artifact_params: dict[str, str],
+    op_config: dict[str, Any] | None,
+    run_name: str,
+    kwargs: dict[str, Any],
+    selected: set[str] | None,
+) -> Iterator[dg.Output]:
+    """Call one node function and turn its return into Dagster outputs.
+
+    Shared by the asset path and the op path — the only difference between them
+    is where the config and the selection come from.
+    """
+    node = manifest.nodes[node_name]
+    value_outputs = [o for o in node.outputs if o not in node.artifacts]
+
+    ctx = NodeContext(vars=op_config or {}, run_name=run_name, artifacts=artifacts)
+    call_kwargs = dict(kwargs)
+    for param, key in artifact_params.items():
+        call_kwargs[param] = ctx.artifact(key)
+    for key in node.artifacts.values():
+        _prepare_artifact_location(artifacts[key])
+
+    returned = described.fn(ctx, **call_kwargs)
+    if described.is_async:
+        returned = asyncio.run(returned)
+
+    values = _unpack_return(node_name, returned, value_outputs)
+    for output in node.outputs:
+        # A node is atomic — it always computes everything — but `--select` may
+        # have asked for only some of its outputs, and Dagster requires that only
+        # the selected ones are yielded.
+        if selected is not None and output not in selected:
+            continue
+        bound = node.artifacts.get(output)
+        if bound is None:
+            yield dg.Output(values[output], output)
+        else:
+            _assert_artifact_written(node_name, bound, artifacts[bound])
+            yield dg.Output(None, output, metadata={"location": str(artifacts[bound])})
+
+
 def _compile_body(
     manifest: Manifest,
     node_name: str,
@@ -202,42 +484,21 @@ def _compile_body(
     artifacts: dict[str, ArtifactLocation],
     artifact_params: dict[str, str],
 ) -> Callable[..., Any]:
-    """Wrap a plain node function as a Dagster compute function."""
-    node = manifest.nodes[node_name]
-    value_outputs = [o for o in node.outputs if o not in node.artifacts]
-    artifact_outputs = {o: key for o, key in node.artifacts.items()}
+    """Wrap a plain node function as the compute function of a `multi_asset`."""
 
     def compute(context: dg.AssetExecutionContext, **kwargs: Any) -> Iterator[dg.Output]:
-        ctx = NodeContext(
-            vars=context.op_execution_context.op_config or {},
-            run_name=getattr(context.resources, RESOURCE_KEY).run_name,
-            artifacts=artifacts,
+        inner = context.op_execution_context
+        yield from _invoke_node(
+            manifest,
+            node_name,
+            described,
+            artifacts,
+            artifact_params,
+            inner.op_config,
+            getattr(context.resources, RESOURCE_KEY).run_name,
+            kwargs,
+            set(inner.selected_output_names),
         )
-        call_kwargs = dict(kwargs)
-        for param, key in artifact_params.items():
-            call_kwargs[param] = ctx.artifact(key)
-
-        for key in artifact_outputs.values():
-            _prepare_artifact_location(artifacts[key])
-
-        returned = described.fn(ctx, **call_kwargs)
-        if described.is_async:
-            returned = asyncio.run(returned)
-
-        values = _unpack_return(node_name, returned, value_outputs)
-        # A node is atomic — it always computes everything — but `--select` may
-        # have asked for only some of its outputs, and Dagster requires that only
-        # the selected ones are yielded.
-        selected = context.op_execution_context.selected_output_names
-        for output in node.outputs:
-            if output not in selected:
-                continue
-            bound = artifact_outputs.get(output)
-            if bound is None:
-                yield dg.Output(values[output], output)
-            else:
-                _assert_artifact_written(node_name, bound, artifacts[bound])
-                yield dg.Output(None, output, metadata={"location": str(artifacts[bound])})
 
     compute.__name__ = node_name
     # Dagster binds inputs by inspecting the signature, so it must name exactly the
@@ -247,10 +508,40 @@ def _compile_body(
         [inspect.Parameter("context", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
         + [
             inspect.Parameter(param, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            for param in node.inputs
+            for param in manifest.nodes[node_name].inputs
             if param not in artifact_params
         ]
     )
+    return compute
+
+
+def _compile_op_body(
+    manifest: Manifest,
+    node_name: str,
+    described: NodeFunction,
+    artifacts: dict[str, ArtifactLocation],
+    artifact_params: dict[str, str],
+) -> Callable[..., Any]:
+    """Wrap a plain node function as the compute function of an op inside a graph.
+
+    A graph-backed asset does not subset, so every declared output is always
+    yielded — hence `selected=None`.
+    """
+
+    def compute(context: dg.OpExecutionContext, **kwargs: Any) -> Iterator[dg.Output]:
+        yield from _invoke_node(
+            manifest,
+            node_name,
+            described,
+            artifacts,
+            artifact_params,
+            context.op_config,
+            getattr(context.resources, RESOURCE_KEY).run_name,
+            kwargs,
+            None,
+        )
+
+    compute.__name__ = node_name
     return compute
 
 
@@ -423,18 +714,30 @@ def _compile_run_job(
 
 
 def run_config(manifest: Manifest, result: CheckResult, run_name: str | None) -> dict[str, Any]:
-    """The Dagster run config for a run preset: per-node variables plus the run name."""
+    """The Dagster run config for a run preset: per-node variables plus the run name.
+
+    A node folded into a graph-backed asset sits one level deeper in the config
+    tree (`ops.<graph>.ops.<node>.config`), so the paths come from the partition
+    rather than being assumed flat.
+    """
+    config: dict[str, Any] = {"resources": {RESOURCE_KEY: {"config": {"run_name": run_name or ""}}}}
     if run_name is None:
-        return {"resources": {RESOURCE_KEY: {"config": {"run_name": ""}}}}
+        return config
+
     resolved = resolve_run(manifest, result.runs, run_name)
-    return {
-        "ops": {
-            node_name: {"config": dict(values)}
-            for node_name, values in resolved.per_node.items()
-            if values
-        },
-        "resources": {RESOURCE_KEY: {"config": {"run_name": run_name}}},
-    }
+    for cluster in partition(manifest, result.graph):
+        for node_name in cluster.members:
+            values = resolved.per_node.get(node_name)
+            if not values:
+                continue
+            _set_path(config, config_path(cluster, node_name), dict(values))
+    return config
+
+
+def _set_path(tree: dict[str, Any], path: list[str], value: Any) -> None:
+    for segment in path[:-1]:
+        tree = tree.setdefault(segment, {})
+    tree[path[-1]] = value
 
 
 def _executor(executor: str) -> Any:
