@@ -300,7 +300,7 @@ Explicit rules:
 
 1. **Parameters.** `ctx` first, then one parameter per declared input, names matching the manifest's `inputs` keys exactly. Mismatch (missing/extra/renamed parameter) → `dagnet check` error naming both sides. An input wired to a `node.output` reference receives that value; an input wired to an artifact receives its resolved location.
 2. **Return.** A dict with one entry per *value* output. Outputs bound to artifacts are **not** returned — the node writes the artifact itself (to `ctx.artifact("db/drugs")`-resolved location), and the wrapper records the materialization. A node with only artifact outputs returns nothing. The netrun dict-shaped return annotation is kept as *optional, validated documentation*: if present it must match the declared outputs.
-3. **`ctx`** is a small wrapper-owned object (not Dagster's context — nodes stay framework-agnostic): `ctx.vars` (resolved variables: globals + this node's overrides), `ctx.artifact(key)` (resolved location of any declared artifact), `ctx.run_name`.
+3. **`ctx`** is a small wrapper-owned object (not Dagster's context — nodes stay framework-agnostic): `ctx.vars` (resolved variables: globals + this node's overrides), `ctx.artifact(key)` (resolved location of any declared artifact), `ctx.run_name`, `ctx.node_name` (this node's manifest name), `ctx.manifest_path` (absolute path of the manifest this pipeline was compiled from). The last two are read-only properties and carry no semantics of their own; they exist so a library helper a node opts into can answer "which node am I, and where is the map?" without cwd-relative guessing — the working directory is not stable across executors, since each step of a multiprocess run is its own process. *(Added 2026-07-27 at the request of `dagnet-db`; see §12.)*
 4. **Printing/logging.** netrun injected a special `print`; that's gone. Use normal `print` — Dagster captures stdout/stderr per step into the run's logs, viewable in the UI.
 5. **nblite is untouched.** `fn` points at the exported function in `src/`; whether it was authored as a `.pct.py` notebook is invisible to the wrapper.
 6. **Check functions** (§5.5) follow the same shape *(decided 2026-07-27)*:
@@ -425,6 +425,12 @@ Building `sample_projects/09_ai_index` — a topologically faithful replica of t
 
 - [P] **Global retries default**: `[pipeline] retries` (§5.1). A node's own `retries` replaces it **entirely**, with no field-wise merging — an override is the whole policy. No retries anywhere means no retry. Evidence: netrun's one top-level `retries: 3, retry_wait: 10` covered all 18 AISI nodes, and without an equivalent the replica repeated the same three lines eight times.
 - [P] **Environment-sourced variables**: an optional `env = "NAME"` on any variable declaration (§5.3), with the resolution order run value > environment > declared default > loud launch error naming both. Declaration-side only — **no** value-side `${VAR}` interpolation in runs files or manifest values. Evidence: netrun wrote `{ "$env": "ADZUNA_S3_PREFIX" }`, and dagnet's only alternative was for node code to read `os.environ` itself, which puts configuration back outside the map.
+
+### Decided 2026-07-27, requested by `dagnet-db`
+
+`dagnet-db` is a sibling package built against dagnet as a git dependency, providing helpers a node opts into (its `init`/`connect`).
+
+- [P] **`ctx.node_name` and `ctx.manifest_path`** (§7 rule 3): two read-only properties on the node context. A helper called from inside a node body needs to know which node is calling it and where the map is; the manifest is a pipeline's discovery root, so exposing its path is aligned with the rest of the design, and resolving anything cwd-relative would be fragile — a multiprocess step runs in its own process. `manifest_path` is absolute, resolved once at compile time. Pure additions: no semantic change, nothing existing altered, no version-scheme change.
 
 ### Not being done
 

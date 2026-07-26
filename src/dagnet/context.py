@@ -62,7 +62,7 @@ def resolve_artifacts(manifest: Manifest, store_root: Path) -> dict[str, Artifac
 class NodeContext:
     """What a node function's `ctx` parameter is."""
 
-    __slots__ = ("run_name", "vars", "_artifacts")
+    __slots__ = ("run_name", "vars", "_artifacts", "_manifest_path", "_node_name")
 
     def __init__(
         self,
@@ -70,11 +70,35 @@ class NodeContext:
         vars: Mapping[str, Scalar],
         run_name: str,
         artifacts: Mapping[str, ArtifactLocation],
+        node_name: str,
+        manifest_path: Path,
     ):
         #: this node's resolved variables: globals overridden by its own.
         self.vars: Mapping[str, Scalar] = MappingProxyType(dict(vars))
         self.run_name = run_name
         self._artifacts = artifacts
+        self._node_name = node_name
+        self._manifest_path = manifest_path
+
+    @property
+    def node_name(self) -> str:
+        """The manifest name of the node currently executing.
+
+        Read-only: a node does not get to decide which node it is. For an asset
+        check, this is the node that produced the output being checked.
+        """
+        return self._node_name
+
+    @property
+    def manifest_path(self) -> Path:
+        """Absolute path of the manifest this pipeline was compiled from.
+
+        Read-only. The manifest is a pipeline's discovery root, so a library
+        helper a node opts into can locate anything relative to it rather than
+        guessing from the working directory — which is not stable across
+        executors, since each step of a multiprocess run is its own process.
+        """
+        return self._manifest_path
 
     def artifact(self, key: str) -> ArtifactLocation:
         """The resolved location of a declared artifact — a `Path`, or a table name."""
@@ -86,7 +110,10 @@ class NodeContext:
             ) from None
 
     def __repr__(self) -> str:
-        return f"NodeContext(run_name={self.run_name!r}, vars={dict(self.vars)!r})"
+        return (
+            f"NodeContext(node_name={self._node_name!r}, run_name={self.run_name!r}, "
+            f"vars={dict(self.vars)!r})"
+        )
 
 
 def _suggest(key: str, known: Mapping[str, ArtifactLocation]) -> str:

@@ -118,3 +118,56 @@ def test_run_preset_variables_survive_the_process_boundary(project, importable_i
         runs="[runs.big]\nsample_n = 42\n",
     )
     assert run_multiprocess(written, run_name="big")
+
+
+def test_node_name_and_manifest_path_survive_the_process_boundary(
+    project, importable_in_subprocesses
+):
+    """`ctx` is rebuilt in each step subprocess, so both must be right there too.
+
+    The subprocess has no reason to share the parent's working directory, which
+    is exactly why `ctx.manifest_path` is absolute.
+    """
+    written = project(
+        """
+        [nodes.alpha]
+        fn = "MOD.alpha"
+        outputs = ["out"]
+
+        [nodes.beta]
+        fn = "MOD.beta"
+        inputs = { upstream = "alpha.out" }
+        outputs = ["out"]
+        """,
+        module="""
+        import os
+        from pathlib import Path
+
+        SEEN = Path(__file__).with_suffix(".seen")
+
+        def _record(ctx):
+            assert ctx.manifest_path.is_absolute(), ctx.manifest_path
+            assert ctx.manifest_path.exists(), ctx.manifest_path
+            with SEEN.open("a") as handle:
+                handle.write(f"{ctx.node_name} {ctx.manifest_path} {os.getpid()}\\n")
+            return {"out": True}
+
+        def alpha(ctx):
+            return _record(ctx)
+
+        def beta(ctx, upstream):
+            return _record(ctx)
+        """,
+    )
+    assert run_multiprocess(written)
+
+    lines = [
+        line.split()
+        for line in (written.root / f"{written.module}.seen").read_text().split("\n")
+        if line
+    ]
+    assert [line[0] for line in lines] == ["alpha", "beta"]
+    assert {line[1] for line in lines} == {str(written.manifest_path.resolve())}
+    # Two distinct subprocesses, neither of which is this one.
+    pids = {line[2] for line in lines}
+    assert len(pids) == 2 and str(os.getpid()) not in pids

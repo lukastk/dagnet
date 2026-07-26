@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 
 import dagster as dg
 import pytest
@@ -1214,3 +1215,144 @@ def test_defaults_apply_to_a_run_with_no_preset(project):
         runs="[defaults]\nn = 99\n\n[runs.other]\nn = 5\n",
     )
     assert materialize(written).output_for_node("a", "seen") == 99
+
+
+# --- ctx.node_name / ctx.manifest_path -------------------------------------
+
+
+IDENTITY_MODULE = """
+    def show(ctx):
+        return {"seen": {"node": ctx.node_name, "manifest": str(ctx.manifest_path)}}
+"""
+
+
+def test_each_node_sees_its_own_name_and_the_manifest_path(project):
+    written = project(
+        """
+        [nodes.first]
+        fn = "MOD.show"
+        outputs = ["seen"]
+
+        [nodes.second]
+        fn = "MOD.show"
+        outputs = ["seen"]
+        """,
+        module=IDENTITY_MODULE,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert result.output_for_node("first", "seen")["node"] == "first"
+    assert result.output_for_node("second", "seen")["node"] == "second"
+    for node in ("first", "second"):
+        seen = Path(result.output_for_node(node, "seen")["manifest"])
+        assert seen == written.manifest_path.resolve()
+        assert seen.is_absolute()
+
+
+def test_the_manifest_path_is_absolute_even_when_the_caller_passed_a_relative_one(
+    project, monkeypatch
+):
+    written = project(
+        """
+        [nodes.only]
+        fn = "MOD.show"
+        outputs = ["seen"]
+        """,
+        module=IDENTITY_MODULE,
+    )
+    monkeypatch.chdir(written.root)
+    job = build_job(written.manifest_path.name, [], executor="in_process")
+    home = written.root / ".dagster"
+    home.mkdir(exist_ok=True)
+    (home / "dagster.yaml").write_text("{}\n")
+    with dg.DagsterInstance.from_config(str(home)) as instance:
+        result = job.execute_in_process(instance=instance, raise_on_error=False)
+    assert result.success, result
+    assert (
+        Path(result.output_for_node("only", "seen")["manifest"]) == written.manifest_path.resolve()
+    )
+
+
+def test_a_node_folded_into_a_graph_backed_asset_still_knows_its_own_name(project):
+    """The op path builds its own ctx, so it needs its own coverage."""
+    written = project(
+        """
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["out"]
+
+        [nodes.transient]
+        fn = "MOD.record"
+        inputs = { x = "src.out" }
+        outputs = ["out"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.record"
+        inputs = { x = "transient.out" }
+        outputs = ["out"]
+        """,
+        module="""
+        def src(ctx):
+            return {"out": []}
+
+        def record(ctx, x):
+            return {"out": x + [(ctx.node_name, ctx.manifest_path.name)]}
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    assert result.output_for_node("sink_graph.sink", "out") == [
+        ("transient", written.manifest_path.name),
+        ("sink", written.manifest_path.name),
+    ]
+
+
+def test_a_check_sees_the_node_that_produced_what_it_is_checking(project):
+    written = project(
+        """
+        [nodes.producer]
+        fn = "MOD.producer"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.records_identity"] }
+        """,
+        module="""
+        from pathlib import Path
+
+        SEEN = Path(__file__).with_suffix(".seen")
+
+        def producer(ctx):
+            return {"rows": [1, 2]}
+
+        def records_identity(ctx, rows):
+            SEEN.write_text(f"{ctx.node_name}|{ctx.manifest_path}")
+            return True
+        """,
+    )
+    result = materialize(written)
+    assert result.success, result
+    node, manifest = (written.root / f"{written.module}.seen").read_text().split("|")
+    assert node == "producer"
+    assert Path(manifest) == written.manifest_path.resolve()
+
+
+def test_both_are_read_only(project):
+    written = project(
+        """
+        [nodes.only]
+        fn = "MOD.only"
+        outputs = ["refused"]
+        """,
+        module="""
+        def only(ctx):
+            refused = []
+            for attribute, value in (("node_name", "elsewhere"), ("manifest_path", "/tmp/x")):
+                try:
+                    setattr(ctx, attribute, value)
+                except AttributeError:
+                    refused.append(attribute)
+            return {"refused": refused}
+        """,
+    )
+    result = materialize(written)
+    assert result.output_for_node("only", "refused") == ["node_name", "manifest_path"]

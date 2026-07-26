@@ -45,6 +45,24 @@ dagnet dev                            # the Dagster UI, run history, re-executio
 dagnet graph                          # Mermaid, for a README
 ```
 
+## `ctx` — the whole surface a node sees
+
+Node code imports no framework. Everything a node gets from dagnet arrives on `ctx`,
+and there is nothing else:
+
+| | |
+|---|---|
+| `ctx.vars` | this node's resolved variables — globals, its own declarations, and whatever the run preset set, already merged. A read-only mapping. |
+| `ctx.artifact(key)` | the resolved location of any declared artifact: a `Path` for a file, a `.table`/`.database` handle for a DuckDB table. An undeclared key raises. |
+| `ctx.run_name` | the run preset's name, or `""` when launched without one. |
+| `ctx.node_name` | this node's name in the manifest. Read-only. |
+| `ctx.manifest_path` | absolute path of the manifest this pipeline was compiled from. Read-only. |
+
+The last two exist mainly for library helpers a node opts into: they answer "which
+node am I, and where is the map?" without resolving anything relative to the working
+directory, which is not stable across executors — each step of a multiprocess run is
+its own process.
+
 ## Status
 
 **v0 is built** — the manifest and runs schema, `dagnet check`, the compiler to Dagster

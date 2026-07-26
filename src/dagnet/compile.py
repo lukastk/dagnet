@@ -105,6 +105,10 @@ def compile_definitions(
     """Turn a passed `CheckResult` into `Definitions`, with one job per run preset."""
     manifest = result.manifest
     graph = result.graph
+    # Resolved once, here: `ctx.manifest_path` promises an absolute path, and a
+    # multiprocess step runs in its own process whose working directory is not
+    # something a node should have to reason about.
+    manifest_path = manifest_path.resolve()
     override = str(store_root) if store_root is not None else None
     artifacts = resolve_artifacts(manifest, resolve_store_root(manifest, manifest_path, override))
 
@@ -115,13 +119,19 @@ def compile_definitions(
     checks: list[dg.AssetChecksDefinition] = []
     for cluster in clusters:
         if cluster.is_graph_backed:
-            assets.append(_compile_cluster(manifest, graph, cluster, result.functions, artifacts))
+            assets.append(
+                _compile_cluster(
+                    manifest, graph, cluster, result.functions, artifacts, manifest_path
+                )
+            )
         else:
             assets.append(
-                _compile_node(manifest, graph, cluster.assets[0], result.functions, artifacts)
+                _compile_node(
+                    manifest, graph, cluster.assets[0], result.functions, artifacts, manifest_path
+                )
             )
         for node_name in cluster.assets:
-            checks.extend(_compile_checks(manifest, node_name, artifacts))
+            checks.extend(_compile_checks(manifest, node_name, artifacts, manifest_path))
 
     preset_names = sorted(result.runs.runs) if result.runs is not None else []
     jobs = [_compile_run_job(manifest, result, name, executor) for name in preset_names]
@@ -142,6 +152,7 @@ def _compile_node(
     node_name: str,
     functions: dict[str, NodeFunction],
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
 ) -> dg.AssetsDefinition:
     node = manifest.nodes[node_name]
     described = functions.get(node_name) or describe(_must_import(node.fn))
@@ -182,7 +193,9 @@ def _compile_node(
         for output in manifest.nodes[target].outputs:
             deps.append(dg.AssetKey(list(asset_key(manifest, target, output))))
 
-    compute = _compile_body(manifest, node_name, described, artifacts, artifact_params)
+    compute = _compile_body(
+        manifest, node_name, described, artifacts, manifest_path, artifact_params
+    )
     return dg.multi_asset(
         name=node_name,
         outs=outs,
@@ -219,6 +232,7 @@ def _compile_cluster(
     cluster: Cluster,
     functions: dict[str, NodeFunction],
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
 ) -> dg.AssetsDefinition:
     """Build the graph-backed asset for a cluster with op-nodes folded in.
 
@@ -254,7 +268,9 @@ def _compile_cluster(
                 ordering_inputs.setdefault(key, _graph_input_name("dep", key))
 
     ops = {
-        member: _compile_op(manifest, graph, member, cluster, functions, artifacts, value_inputs)
+        member: _compile_op(
+            manifest, graph, member, cluster, functions, artifacts, manifest_path, value_inputs
+        )
         for member in cluster.members
     }
 
@@ -297,6 +313,7 @@ def _compile_op(
     cluster: Cluster,
     functions: dict[str, NodeFunction],
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
     value_inputs: dict[tuple[str, ...], str],
 ) -> dg.OpDefinition:
     """One member of a cluster, as an op rather than an asset."""
@@ -318,7 +335,9 @@ def _compile_op(
         for output in node.outputs
     }
 
-    compute = _compile_op_body(manifest, node_name, described, artifacts, artifact_params)
+    compute = _compile_op_body(
+        manifest, node_name, described, artifacts, manifest_path, artifact_params
+    )
     # A `Nothing` input carries no value, so Dagster forbids it as a parameter: it
     # is declared in `ins` and supplied only when the op is invoked in the graph.
     compute.__signature__ = inspect.Signature(
@@ -438,6 +457,7 @@ def _invoke_node(
     node_name: str,
     described: NodeFunction,
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
     artifact_params: dict[str, str],
     op_config: dict[str, Any] | None,
     run_name: str,
@@ -452,7 +472,13 @@ def _invoke_node(
     node = manifest.nodes[node_name]
     value_outputs = [o for o in node.outputs if o not in node.artifacts]
 
-    ctx = NodeContext(vars=op_config or {}, run_name=run_name, artifacts=artifacts)
+    ctx = NodeContext(
+        vars=op_config or {},
+        run_name=run_name,
+        artifacts=artifacts,
+        node_name=node_name,
+        manifest_path=manifest_path,
+    )
     call_kwargs = dict(kwargs)
     for param, key in artifact_params.items():
         call_kwargs[param] = ctx.artifact(key)
@@ -483,6 +509,7 @@ def _compile_body(
     node_name: str,
     described: NodeFunction,
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
     artifact_params: dict[str, str],
 ) -> Callable[..., Any]:
     """Wrap a plain node function as the compute function of a `multi_asset`."""
@@ -494,6 +521,7 @@ def _compile_body(
             node_name,
             described,
             artifacts,
+            manifest_path,
             artifact_params,
             inner.op_config,
             getattr(context.resources, RESOURCE_KEY).run_name,
@@ -521,6 +549,7 @@ def _compile_op_body(
     node_name: str,
     described: NodeFunction,
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
     artifact_params: dict[str, str],
 ) -> Callable[..., Any]:
     """Wrap a plain node function as the compute function of an op inside a graph.
@@ -535,6 +564,7 @@ def _compile_op_body(
             node_name,
             described,
             artifacts,
+            manifest_path,
             artifact_params,
             context.op_config,
             getattr(context.resources, RESOURCE_KEY).run_name,
@@ -638,7 +668,10 @@ def _config_schema(manifest: Manifest, node_name: str) -> dict[str, dg.Field]:
 
 
 def _compile_checks(
-    manifest: Manifest, node_name: str, artifacts: dict[str, ArtifactLocation]
+    manifest: Manifest,
+    node_name: str,
+    artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
 ) -> list[dg.AssetChecksDefinition]:
     node = manifest.nodes[node_name]
     built: list[dg.AssetChecksDefinition] = []
@@ -648,7 +681,14 @@ def _compile_checks(
         for entry in entries:
             built.append(
                 _compile_check(
-                    manifest, node_name, output, key, as_check_decl(entry), bound, artifacts
+                    manifest,
+                    node_name,
+                    output,
+                    key,
+                    as_check_decl(entry),
+                    bound,
+                    artifacts,
+                    manifest_path,
                 )
             )
     return built
@@ -662,6 +702,7 @@ def _compile_check(
     decl: CheckDecl,
     bound: str | None,
     artifacts: dict[str, ArtifactLocation],
+    manifest_path: Path,
 ) -> dg.AssetChecksDefinition:
     """One check function, as a Dagster asset check.
 
@@ -679,6 +720,9 @@ def _compile_check(
             vars=context.op_execution_context.op_config or {},
             run_name=getattr(context.resources, RESOURCE_KEY).run_name,
             artifacts=artifacts,
+            # A check belongs to the node that produced the output it checks.
+            node_name=node_name,
+            manifest_path=manifest_path,
         )
         # A value output arrives loaded through the IO manager; an artifact-bound
         # output has no value, so the check gets its location instead.
