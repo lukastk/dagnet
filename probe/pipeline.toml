@@ -1,0 +1,10 @@
+[pipeline]
+name = "p"
+
+[vars]
+expected = { type = "int" }
+
+[nodes.a]
+fn = "nodes_probe.a"
+outputs = ["rows"]
+checks = { rows = ["nodes_probe.guard"] }

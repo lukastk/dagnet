@@ -19,7 +19,7 @@ import dagster as dg
 from dagnet._reconstruct import reconstructable_job
 
 
-def run_multiprocess(project, run_name=None) -> bool:
+def run_multiprocess(project, run_name=None, select=None) -> bool:
     home = project.root / ".dagster"
     home.mkdir(exist_ok=True)
     (home / "dagster.yaml").write_text("{}\n")
@@ -27,7 +27,7 @@ def run_multiprocess(project, run_name=None) -> bool:
         manifest=str(project.manifest_path),
         runs=[str(p) for p in project.runs_paths],
         run_name=run_name,
-        select=None,
+        select=select,
         store_root=None,
         executor="multiprocess",
     )
@@ -157,3 +157,59 @@ def test_node_name_and_manifest_path_survive_the_process_boundary(
     # Two distinct subprocesses, neither of which is this one.
     pids = {line[2] for line in lines}
     assert len(pids) == 2 and str(os.getpid()) not in pids
+
+
+def test_a_selective_run_of_a_vars_manifest_works_under_multiprocess(
+    project, importable_in_subprocesses
+):
+    """The config filtering has to survive the reconstructor too.
+
+    Each subprocess rebuilds the job from the manifest, so it re-derives the
+    selection and its config independently — if the filtering only worked in the
+    parent, every step would fail on its own config.
+    """
+    written = project(
+        """
+        [vars]
+        scale = { type = "int", default = 2 }
+
+        [nodes.raw]
+        fn = "MOD.raw"
+        outputs = ["rows"]
+
+        [nodes.clean]
+        fn = "MOD.clean"
+        inputs = { rows = "raw.rows" }
+        outputs = ["rows"]
+
+        [nodes.report]
+        fn = "MOD.report"
+        inputs = { rows = "clean.rows" }
+        outputs = ["summary"]
+        """,
+        module="""
+        from pathlib import Path
+
+        RAN = Path(__file__).with_suffix(".ran")
+
+        def _note(name):
+            with RAN.open("a") as handle:
+                handle.write(name + "\\n")
+
+        def raw(ctx):
+            _note("raw")
+            return {"rows": [1, 2, 3]}
+
+        def clean(ctx, rows):
+            _note("clean")
+            assert ctx.vars["scale"] == 2, dict(ctx.vars)
+            return {"rows": [r * ctx.vars["scale"] for r in rows]}
+
+        def report(ctx, rows):
+            _note("report")
+            return {"summary": sum(rows)}
+        """,
+    )
+    assert run_multiprocess(written, select="*clean/rows")
+    ran = (written.root / f"{written.module}.ran").read_text().split()
+    assert sorted(ran) == ["clean", "raw"], "the selection must not pull `report` in"

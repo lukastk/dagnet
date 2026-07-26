@@ -134,7 +134,10 @@ def compile_definitions(
             checks.extend(_compile_checks(manifest, node_name, artifacts, manifest_path))
 
     preset_names = sorted(result.runs.runs) if result.runs is not None else []
-    jobs = [_compile_run_job(manifest, result, name, executor) for name in preset_names]
+    check_owners = check_op_owners(manifest, checks)
+    jobs = [
+        _compile_run_job(manifest, result, name, executor, check_owners) for name in preset_names
+    ]
     return dg.Definitions(
         assets=assets,
         asset_checks=checks,
@@ -767,27 +770,69 @@ def _as_check_result(
 
 
 def _compile_run_job(
-    manifest: Manifest, result: CheckResult, run_name: str, executor: str
+    manifest: Manifest,
+    result: CheckResult,
+    run_name: str,
+    executor: str,
+    check_owners: dict[str, str],
 ) -> dg.JobDefinition:
     """One job per run preset, with its resolved variables baked in as config.
 
     This is what makes DESIGN §6's "visible/editable in the launchpad" true: each
     named run shows up in the UI as a job whose config is already filled in.
+    Selection is `*`, so no op filtering is needed — but asset checks are separate
+    ops with their own config, and they still need theirs.
     """
     return dg.define_asset_job(
         name=run_name,
         selection="*",
-        config=run_config(manifest, result, run_name),
+        config=run_config(manifest, result, run_name, check_owners=check_owners),
         executor_def=_executor(executor),
     )
 
 
-def run_config(manifest: Manifest, result: CheckResult, run_name: str | None) -> dict[str, Any]:
+def check_op_owners(manifest: Manifest, asset_checks: Any) -> dict[str, str]:
+    """Map each asset check's op name to the node whose output it checks.
+
+    A check compiles to its own op, with its own copy of the owning node's config
+    schema, and Dagster names that op itself (`<asset__key>_<check>`). Rather than
+    reconstruct that name, read it back off the built definition.
+    """
+    owners = {
+        "/".join(asset_key(manifest, node_name, output)): node_name
+        for node_name, node in manifest.nodes.items()
+        for output in node.outputs
+    }
+    mapping: dict[str, str] = {}
+    for definition in asset_checks or []:
+        for check_key in definition.check_keys:
+            node_name = owners.get(check_key.asset_key.to_user_string())
+            if node_name is not None:
+                mapping[definition.node_def.name] = node_name
+    return mapping
+
+
+def run_config(
+    manifest: Manifest,
+    result: CheckResult,
+    run_name: str | None,
+    *,
+    check_owners: dict[str, str] | None = None,
+    op_names: set[str] | None = None,
+) -> dict[str, Any]:
     """The Dagster run config for a run preset: per-node variables plus the run name.
 
     A node folded into a graph-backed asset sits one level deeper in the config
     tree (`ops.<graph>.ops.<node>.config`), so the paths come from the partition
     rather than being assumed flat.
+
+    `op_names`, when given, is the set of ops the job actually contains. A
+    subsetted job — anything launched with `--select` — rejects config for ops it
+    does not have, so emitting the whole pipeline's config would make every
+    selective run of a `[vars]`-declaring manifest fail before it started.
+
+    `check_owners` maps check ops to their node, so a check reading `ctx.vars`
+    gets the same values its node does.
     """
     config: dict[str, Any] = {"resources": {RESOURCE_KEY: {"config": {"run_name": run_name or ""}}}}
 
@@ -800,12 +845,24 @@ def run_config(manifest: Manifest, result: CheckResult, run_name: str | None) ->
         raise UnresolvedVariable(
             f"{launching} cannot start:\n" + "\n".join(f"  - {m.describe()}" for m in missing)
         )
+
+    def wanted(op_name: str) -> bool:
+        return op_names is None or op_name in op_names
+
     for cluster in partition(manifest, result.graph):
+        if not wanted(cluster.name):
+            continue
         for node_name in cluster.members:
             values = resolved.per_node.get(node_name)
             if not values:
                 continue
             _set_path(config, config_path(cluster, node_name), dict(values))
+
+    for op_name, node_name in (check_owners or {}).items():
+        values = resolved.per_node.get(node_name)
+        if values and wanted(op_name):
+            _set_path(config, ["ops", op_name, "config"], dict(values))
+
     return config
 
 
@@ -846,18 +903,34 @@ def build_job(
         raise CompileError(f"no run named '{run_name}' (known runs: {known})")
 
     defs = compile_definitions(result, manifest_path, store_root=store_root, executor=executor)
-    job = dg.define_asset_job(
-        name=DEFAULT_JOB_NAME,
-        selection=select or "*",
-        config=run_config(result.manifest, result, run_name),
-        executor_def=_executor(executor),
+
+    def resolve(config: dict[str, Any] | None) -> dg.JobDefinition:
+        job = dg.define_asset_job(
+            name=DEFAULT_JOB_NAME,
+            selection=select or "*",
+            config=config,
+            executor_def=_executor(executor),
+        )
+        return dg.Definitions(
+            assets=defs.assets,
+            asset_checks=defs.asset_checks,
+            jobs=[job],
+            resources=defs.resources,
+        ).resolve_job_def(DEFAULT_JOB_NAME)
+
+    # Which ops a selection resolves to is Dagster's answer, not one we can
+    # predict from the manifest — `--select` is its syntax, and subsetting rules
+    # are its own. So build once unconfigured to ask, then once for real. Only
+    # the definitions are reused; nothing executes in between.
+    probe = resolve(None)
+    config = run_config(
+        result.manifest,
+        result,
+        run_name,
+        check_owners=check_op_owners(result.manifest, defs.asset_checks),
+        op_names=set(probe.graph.node_dict),
     )
-    return dg.Definitions(
-        assets=defs.assets,
-        asset_checks=defs.asset_checks,
-        jobs=[job],
-        resources=defs.resources,
-    ).resolve_job_def(DEFAULT_JOB_NAME)
+    return resolve(config)
 
 
 def _must_import(path: str) -> Any:

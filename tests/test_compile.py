@@ -1356,3 +1356,171 @@ def test_both_are_read_only(project):
     )
     result = materialize(written)
     assert result.output_for_node("only", "refused") == ["node_name", "manifest_path"]
+
+
+# --- run config must match the job it is given to --------------------------
+
+
+SELECT_VARS_MANIFEST = """
+    [vars]
+    scale = { type = "int", default = 2 }
+
+    [nodes.raw]
+    fn = "MOD.raw"
+    outputs = ["rows"]
+
+    [nodes.clean]
+    fn = "MOD.clean"
+    inputs = { rows = "raw.rows" }
+    outputs = ["rows"]
+
+    [nodes.report]
+    fn = "MOD.report"
+    inputs = { rows = "clean.rows" }
+    outputs = ["summary"]
+"""
+
+SELECT_VARS_MODULE = """
+    def raw(ctx):
+        return {"rows": [1, 2, 3]}
+
+    def clean(ctx, rows):
+        return {"rows": [r * ctx.vars["scale"] for r in rows]}
+
+    def report(ctx, rows):
+        return {"summary": sum(rows)}
+"""
+
+
+def test_a_selective_run_of_a_vars_manifest_does_not_over_supply_config(project):
+    """A subsetted job rejects config for ops it does not contain.
+
+    dagnet used to emit config for every node regardless, so any `--select` on a
+    manifest declaring `[vars]` died with `DagsterInvalidConfigError` before a
+    single step ran.
+    """
+    written = project(SELECT_VARS_MANIFEST, module=SELECT_VARS_MODULE)
+    result = materialize(written, select="*clean/rows")
+    assert result.success, result
+    assert keys(result) == ["clean/rows", "raw/rows"]
+
+
+def test_the_same_holds_with_a_run_preset(project):
+    written = project(
+        SELECT_VARS_MANIFEST,
+        module=SELECT_VARS_MODULE,
+        runs="[runs.big]\nscale = 10\n",
+    )
+    result = materialize(written, run_name="big", select="*clean/rows")
+    assert result.success, result
+    assert result.output_for_node("clean", "rows") == [10, 20, 30]
+
+
+def test_a_selective_run_still_configures_a_folded_op_node(project):
+    """Graph-backed clusters are one op at the top level; their config nests."""
+    written = project(
+        """
+        [vars]
+        scale = { type = "int", default = 3 }
+
+        [nodes.src]
+        fn = "MOD.src"
+        outputs = ["rows"]
+
+        [nodes.scaled]
+        fn = "MOD.scale"
+        inputs = { rows = "src.rows" }
+        outputs = ["rows"]
+        asset = false
+
+        [nodes.sink]
+        fn = "MOD.sink"
+        inputs = { rows = "scaled.rows" }
+        outputs = ["total"]
+
+        [nodes.unrelated]
+        fn = "MOD.src"
+        outputs = ["rows"]
+        """,
+        module="""
+        def src(ctx):
+            return {"rows": [1, 2]}
+
+        def scale(ctx, rows):
+            return {"rows": [r * ctx.vars["scale"] for r in rows]}
+
+        def sink(ctx, rows):
+            return {"total": sum(rows)}
+        """,
+    )
+    # `unrelated` is out of the selection, so its config must not be emitted.
+    result = materialize(written, select="*sink/total")
+    assert result.success, result
+    assert result.output_for_node("sink_graph.sink", "total") == 9
+
+
+def test_a_check_gets_the_config_its_node_gets(project):
+    """A check is its own op with its own copy of the node's config schema.
+
+    Nothing supplied it before, so a check on a node with a no-default variable
+    could not launch at all.
+    """
+    written = project(
+        """
+        [vars]
+        expected = { type = "int" }
+
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.guard"] }
+        """,
+        module="""
+        def a(ctx):
+            return {"rows": [1, 2]}
+
+        def guard(ctx, rows):
+            return {"passed": len(rows) == ctx.vars["expected"]}
+        """,
+        runs="[runs.only]\nexpected = 2\n",
+    )
+    result = materialize(written, run_name="only")
+    assert result.success, result
+    assert [e.passed for e in result.get_asset_check_evaluations()] == [True]
+
+
+def test_a_selective_run_drops_checks_that_are_out_of_scope(project):
+    written = project(
+        """
+        [vars]
+        expected = { type = "int" }
+
+        [nodes.a]
+        fn = "MOD.a"
+        outputs = ["rows"]
+        checks = { rows = ["MOD.guard"] }
+
+        [nodes.b]
+        fn = "MOD.b"
+        inputs = { rows = "a.rows" }
+        outputs = ["total"]
+        checks = { total = ["MOD.also_guard"] }
+        """,
+        module="""
+        def a(ctx):
+            return {"rows": [1, 2]}
+
+        def b(ctx, rows):
+            return {"total": sum(rows)}
+
+        def guard(ctx, rows):
+            return len(rows) == ctx.vars["expected"]
+
+        def also_guard(ctx, total):
+            return total > 0
+        """,
+        runs="[runs.only]\nexpected = 2\n",
+    )
+    result = materialize(written, run_name="only", select="a/rows")
+    assert result.success, result
+    assert [e.check_name for e in result.get_asset_check_evaluations()] == ["guard"]
