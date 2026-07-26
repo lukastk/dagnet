@@ -32,6 +32,8 @@ CASES = [
     ("07_checks", "good"),
     ("07_checks", "noisy"),
     ("08_pull_select", None),
+    ("09_ai_index", "test_local"),
+    ("09_ai_index", "production_5m"),
 ]
 
 #: Runs that are *supposed* to fail — a blocking check catching a real violation.

@@ -1,6 +1,7 @@
 # dagnet sample projects
 
-Self-contained sample pipelines, each demonstrating one feature area of dagnet.
+Self-contained sample pipelines. 00-08 each demonstrate one feature area; 09 composes
+them all in one realistic pipeline.
 Together they are the de-facto spec and test corpus (mirroring the old netrun
 repo's `sample_projects/`). Each sample is its own uv project with a
 `pipeline.toml`, a `nodes.py` of plain-Python node functions, a `runs.toml` or
@@ -23,6 +24,7 @@ breaks a sample breaks the build.
 | [`06_transient_ops`](06_transient_ops) | `asset = false` nodes folded into graph-backed assets |
 | [`07_checks`](07_checks) | asset checks guarding a schema contract, and what a failure looks like |
 | [`08_pull_select`](08_pull_select) | `dagnet run --select "+key"` pull semantics |
+| [`09_ai_index`](09_ai_index) | **all of the above at once** — a structurally faithful, stub-bodied replica of the AISI exposure index pipeline |
 
 ## Running one
 

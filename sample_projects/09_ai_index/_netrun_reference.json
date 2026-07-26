@@ -1,0 +1,238 @@
+{
+  "_source": "https://github.com/Autonomy-Data-Unit/aisi-exposure-index \u2014 config/netrun.json, fetched 2026-07-27 (read-only).",
+  "_why": "The slice of the real netrun graph that sample 09's topology is checked against: node names, which of them are netrun factory nodes, the edges, the pools, and the global retry settings. Nothing else is reproduced.",
+  "pools": {
+    "main": 4,
+    "heavy": 1
+  },
+  "retries": {
+    "max": 3,
+    "wait_s": 10
+  },
+  "nodes": [
+    {
+      "name": "fetch_onet",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "fetch_adzuna",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "sample_ads",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "prepare_onet_targets",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "llm_filter_candidates",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "broadcast_onet_ready",
+      "factory": "broadcast",
+      "pools": []
+    },
+    {
+      "name": "score_presence",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "score_felten",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "score_task_exposure",
+      "factory": "from_function",
+      "pools": [
+        "heavy"
+      ]
+    },
+    {
+      "name": "score_task_exposure_bt",
+      "factory": "from_function",
+      "pools": [
+        "heavy"
+      ]
+    },
+    {
+      "name": "join_scores",
+      "factory": "join",
+      "pools": []
+    },
+    {
+      "name": "combine_onet_exposure",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "compute_job_ad_exposure",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "aggregate_geo",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "embed_ads",
+      "factory": "from_function",
+      "pools": [
+        "heavy"
+      ]
+    },
+    {
+      "name": "embed_onet",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "cosine_candidates",
+      "factory": "from_function",
+      "pools": []
+    },
+    {
+      "name": "rerank_candidates",
+      "factory": "from_function",
+      "pools": []
+    }
+  ],
+  "edges": [
+    {
+      "source_node": "fetch_onet",
+      "source_port": "__signal_epoch_finished__",
+      "target_node": "prepare_onet_targets",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "fetch_adzuna",
+      "source_port": "__signal_epoch_finished__",
+      "target_node": "sample_ads",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "prepare_onet_targets",
+      "source_port": "__signal_epoch_finished__",
+      "target_node": "broadcast_onet_ready",
+      "target_port": "in_0"
+    },
+    {
+      "source_node": "score_presence",
+      "source_port": "out",
+      "target_node": "join_scores",
+      "target_port": "presence"
+    },
+    {
+      "source_node": "score_felten",
+      "source_port": "out",
+      "target_node": "join_scores",
+      "target_port": "felten"
+    },
+    {
+      "source_node": "score_task_exposure",
+      "source_port": "out",
+      "target_node": "join_scores",
+      "target_port": "task_exposure"
+    },
+    {
+      "source_node": "join_scores",
+      "source_port": "out",
+      "target_node": "combine_onet_exposure",
+      "target_port": "score_dfs"
+    },
+    {
+      "source_node": "combine_onet_exposure",
+      "source_port": "out",
+      "target_node": "compute_job_ad_exposure",
+      "target_port": "exposure_scores"
+    },
+    {
+      "source_node": "compute_job_ad_exposure",
+      "source_port": "ad_ids",
+      "target_node": "aggregate_geo",
+      "target_port": "ad_ids"
+    },
+    {
+      "source_node": "sample_ads",
+      "source_port": "ad_ids",
+      "target_node": "embed_ads",
+      "target_port": "ad_ids"
+    },
+    {
+      "source_node": "embed_ads",
+      "source_port": "ad_ids",
+      "target_node": "cosine_candidates",
+      "target_port": "ad_ids"
+    },
+    {
+      "source_node": "embed_onet",
+      "source_port": "out",
+      "target_node": "cosine_candidates",
+      "target_port": "onet_done"
+    },
+    {
+      "source_node": "broadcast_onet_ready",
+      "source_port": "out_0",
+      "target_node": "embed_onet",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "broadcast_onet_ready",
+      "source_port": "out_1",
+      "target_node": "score_presence",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "broadcast_onet_ready",
+      "source_port": "out_2",
+      "target_node": "score_felten",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "broadcast_onet_ready",
+      "source_port": "out_3",
+      "target_node": "score_task_exposure",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "broadcast_onet_ready",
+      "source_port": "out_4",
+      "target_node": "score_task_exposure_bt",
+      "target_port": "__control_start_epoch__"
+    },
+    {
+      "source_node": "score_task_exposure_bt",
+      "source_port": "out",
+      "target_node": "join_scores",
+      "target_port": "task_exposure_bt"
+    },
+    {
+      "source_node": "cosine_candidates",
+      "source_port": "ad_ids",
+      "target_node": "llm_filter_candidates",
+      "target_port": "ad_ids"
+    },
+    {
+      "source_node": "llm_filter_candidates",
+      "source_port": "successful_ad_ids",
+      "target_node": "rerank_candidates",
+      "target_port": "ad_ids"
+    },
+    {
+      "source_node": "rerank_candidates",
+      "source_port": "ad_ids",
+      "target_node": "compute_job_ad_exposure",
+      "target_port": "ad_ids"
+    }
+  ]
+}

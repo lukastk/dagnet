@@ -1,0 +1,250 @@
+[pipeline]
+name = "ai_index"
+description = "AI exposure index: match job ads to O*NET occupations and score them."
+
+# netrun pools owned threads (main: 4 threads, heavy: 1). Here a pool is purely a
+# limit; parallelism comes from the Dagster executor. `heavy = 1` serializes the
+# GPU/LLM nodes, which is the only thing netrun's `heavy` pool was really doing.
+[pools]
+main = 4
+heavy = 1
+
+# The pipeline's global variables. netrun declared these as top-level `node_vars`;
+# every one is visible to every node via ctx.vars, and a run preset can override
+# any of them globally or for one node.
+#
+# `run_name` is NOT declared: netrun needed it as a variable, dagnet provides
+# `ctx.run_name` natively.
+[vars]
+adzuna_s3_prefix = { type = "str", default = "s3://dummy-bucket/adzuna", description = "Dummy: the real one comes from the environment." }
+sample_n = { type = "int" }
+sample_seed = { type = "int" }
+embedding_model = { type = "str" }
+llm_model = { type = "str" }
+llm_batch_size = { type = "int" }
+llm_max_new_tokens = { type = "int" }
+sbatch_cache = { type = "bool" }
+duckdb_memory_limit = { type = "str" }
+temperature = { type = "float" }
+top_p = { type = "float" }
+top_k = { type = "int" }
+
+# ===========================================================================
+#   Ingest
+# ===========================================================================
+
+[nodes.fetch_onet]
+fn = "ai_index.nodes.fetch_onet"
+description = "Download and extract the O*NET database."
+outputs = ["onet_db"]
+pool = "main"
+retries = { max = 3, wait_s = 10 }
+group = "ingest"
+
+[nodes.fetch_adzuna]
+fn = "ai_index.nodes.fetch_adzuna"
+description = "Pull job ads from the ad archive."
+outputs = ["ads"]
+pool = "main"
+retries = { max = 3, wait_s = 10 }
+group = "ingest"
+
+[nodes.fetch_adzuna.vars]
+fetch_years = { type = "str" }
+skip_fetch = { type = "bool" }
+
+[nodes.sample_ads]
+fn = "ai_index.nodes.sample_ads"
+description = "Sample job ads for processing (or pass through all if sample_n = -1)."
+# netrun: fetch_adzuna's __signal_epoch_finished__ -> sample_ads'
+# __control_start_epoch__. One `after` entry replaces the pair.
+after = ["fetch_adzuna"]
+outputs = ["ad_ids"]
+pool = "main"
+group = "ingest"
+
+[nodes.prepare_onet_targets]
+fn = "ai_index.nodes.prepare_onet_targets"
+description = "Filter O*NET occupations and build text descriptions for embedding."
+after = ["fetch_onet"]
+outputs = ["targets"]
+pool = "main"
+group = "onet"
+
+[nodes.prepare_onet_targets.vars]
+onet_exclude_public_sector = { type = "bool" }
+onet_top_n = { type = "int" }
+
+# ===========================================================================
+#   Matching chain — this is where real values flow
+# ===========================================================================
+
+[nodes.embed_ads]
+fn = "ai_index.nodes.embed_ads"
+description = "Embed raw job ad text."
+inputs = { ad_ids = "sample_ads.ad_ids" }
+outputs = ["ad_ids"]
+pool = "heavy"
+retries = { max = 3, wait_s = 10 }
+group = "match"
+
+[nodes.embed_ads.vars]
+sbatch_time = { type = "str" }
+embed_task_prompt = { type = "str" }
+chunk_size = { type = "int" }
+max_concurrent_chunks = { type = "int" }
+
+[nodes.embed_onet]
+fn = "ai_index.nodes.embed_onet"
+description = "Embed O*NET occupations as single rich documents."
+after = ["prepare_onet_targets"]
+outputs = ["out"]
+pool = "main"
+retries = { max = 3, wait_s = 10 }
+group = "match"
+
+[nodes.embed_onet.vars]
+sbatch_time = { type = "str" }
+
+[nodes.cosine_candidates]
+fn = "ai_index.nodes.cosine_candidates"
+description = "Cosine-similarity top-k candidates for reranking."
+# `onet_done` is a real port in netrun carrying a completion handshake, kept as a
+# value input here rather than quietly turned into `after` — faithful to the map
+# it was generated from.
+inputs = { ad_ids = "embed_ads.ad_ids", onet_done = "embed_onet.out" }
+outputs = ["ad_ids"]
+pool = "main"
+group = "match"
+
+[nodes.cosine_candidates.vars]
+cosine_topk = { type = "int" }
+chunk_size = { type = "int" }
+
+[nodes.llm_filter_candidates]
+fn = "ai_index.nodes.llm_filter_candidates"
+description = "LLM negative selection on the cosine candidates."
+inputs = { ad_ids = "cosine_candidates.ad_ids" }
+outputs = ["successful_ad_ids"]
+pool = "main"
+retries = { max = 3, wait_s = 10 }
+group = "match"
+
+[nodes.llm_filter_candidates.vars]
+sbatch_time = { type = "str" }
+filter_resume = { type = "bool" }
+filter_max_retries = { type = "int" }
+filter_raise_on_failure = { type = "bool" }
+system_prompt = { type = "str" }
+user_prompt = { type = "str" }
+max_concurrent_chunks = { type = "int" }
+
+[nodes.rerank_candidates]
+fn = "ai_index.nodes.rerank_candidates"
+description = "Cross-encoder reranking of the filtered candidates."
+# THE rename: the output is `successful_ad_ids`, the parameter is `ad_ids`.
+inputs = { ad_ids = "llm_filter_candidates.successful_ad_ids" }
+outputs = ["ad_ids"]
+pool = "main"
+retries = { max = 3, wait_s = 10 }
+group = "match"
+
+[nodes.rerank_candidates.vars]
+rerank_model = { type = "str" }
+sbatch_time = { type = "str" }
+chunk_size = { type = "int" }
+max_concurrent_chunks = { type = "int" }
+
+# ===========================================================================
+#   Scoring — four independent scorers, all gated on prepare_onet_targets
+# ===========================================================================
+#
+# netrun fanned prepare_onet_targets' epoch_finished signal out through a
+# `broadcast` factory node with five outputs, because one output port could not
+# feed five edges. Here each node simply says `after = ["prepare_onet_targets"]`
+# and the broadcast node ceases to exist.
+
+[nodes.score_presence]
+fn = "ai_index.nodes.score_presence"
+description = "Humanness/presence scores per O*NET occupation."
+after = ["prepare_onet_targets"]
+outputs = ["out"]
+pool = "main"
+group = "score"
+
+[nodes.score_felten]
+fn = "ai_index.nodes.score_felten"
+description = "Felten AIOE ability-application exposure scores per occupation."
+after = ["prepare_onet_targets"]
+outputs = ["out"]
+pool = "main"
+group = "score"
+
+[nodes.score_felten.vars]
+felten_alpha = { type = "float" }
+felten_scenario = { type = "str" }
+
+[nodes.score_task_exposure]
+fn = "ai_index.nodes.score_task_exposure"
+description = "Classify O*NET tasks by AI exposure via LLM, aggregate to occupations."
+after = ["prepare_onet_targets"]
+outputs = ["out"]
+pool = "heavy"
+retries = { max = 3, wait_s = 10 }
+group = "score"
+
+[nodes.score_task_exposure.vars]
+sbatch_time = { type = "str" }
+system_prompt = { type = "str" }
+user_prompt = { type = "str" }
+
+[nodes.score_task_exposure_bt]
+fn = "ai_index.nodes.score_task_exposure_bt"
+description = "Pairwise Bradley-Terry scoring of O*NET tasks by AI exposure."
+after = ["prepare_onet_targets"]
+outputs = ["out"]
+pool = "heavy"
+retries = { max = 3, wait_s = 10 }
+group = "score"
+
+[nodes.score_task_exposure_bt.vars]
+sbatch_time = { type = "str" }
+n_rounds = { type = "int" }
+comparisons_per_item_r1 = { type = "int" }
+comparisons_per_item_r2 = { type = "int" }
+comparisons_per_item_r3 = { type = "int" }
+system_prompt = { type = "str" }
+user_prompt = { type = "str" }
+
+# ===========================================================================
+#   Combine and aggregate
+# ===========================================================================
+
+[nodes.combine_onet_exposure]
+fn = "ai_index.nodes.combine_onet_exposure"
+description = "Merge all O*NET score tables into a single combined exposure table."
+# netrun put a `join` factory node here purely to wait for four upstreams and
+# hand them on as one bundle. A node with four inputs is that, without the node.
+inputs = { presence = "score_presence.out", felten = "score_felten.out", task_exposure = "score_task_exposure.out", task_exposure_bt = "score_task_exposure_bt.out" }
+outputs = ["out"]
+pool = "main"
+group = "combine"
+
+[nodes.compute_job_ad_exposure]
+fn = "ai_index.nodes.compute_job_ad_exposure"
+description = "Map occupation-level exposure onto individual job ads."
+inputs = { exposure_scores = "combine_onet_exposure.out", ad_ids = "rerank_candidates.ad_ids" }
+outputs = ["ad_ids"]
+pool = "main"
+group = "combine"
+
+[nodes.compute_job_ad_exposure.vars]
+exposure_chunk_size = { type = "int" }
+
+[nodes.aggregate_geo]
+fn = "ai_index.nodes.aggregate_geo"
+description = "Aggregate ad-level exposure by Local Authority District."
+inputs = { ad_ids = "compute_job_ad_exposure.ad_ids" }
+outputs = ["by_lad"]
+pool = "main"
+group = "combine"

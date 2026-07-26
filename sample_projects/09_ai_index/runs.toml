@@ -1,0 +1,178 @@
+# Structurally the real pipeline's `config/run_defs.toml`: a [defaults] section
+# carrying every base value, then named runs that override globally and per node.
+# Model names and endpoints are dummies.
+
+[defaults]
+sample_n = 10
+sample_seed = 42
+embedding_model = "dummy-embed-base"
+llm_model = "dummy-llm-7b"
+llm_batch_size = 50000
+llm_max_new_tokens = 2048
+sbatch_cache = true
+duckdb_memory_limit = "4GB"
+temperature = 0.0
+top_p = 1.0
+top_k = -1
+
+[defaults.fetch_adzuna]
+fetch_years = "all"
+skip_fetch = true
+
+[defaults.prepare_onet_targets]
+onet_exclude_public_sector = true
+onet_top_n = 10
+
+[defaults.embed_onet]
+sbatch_time = "01:00:00"
+
+[defaults.embed_ads]
+sbatch_time = "04:00:00"
+embed_task_prompt = ""
+chunk_size = 50000
+max_concurrent_chunks = 10
+
+[defaults.cosine_candidates]
+cosine_topk = 20
+chunk_size = 50000
+
+[defaults.rerank_candidates]
+rerank_model = "dummy-reranker-8b"
+sbatch_time = "04:00:00"
+chunk_size = 50000
+max_concurrent_chunks = 10
+
+[defaults.llm_filter_candidates]
+sbatch_time = "12:00:00"
+max_concurrent_chunks = 10
+filter_resume = true
+filter_max_retries = 3
+filter_raise_on_failure = false
+system_prompt = "llm_filter/v2/system"
+user_prompt = "llm_filter/v2/user"
+
+[defaults.compute_job_ad_exposure]
+exposure_chunk_size = 50000
+
+[defaults.score_felten]
+felten_alpha = 0.5
+felten_scenario = "baseline_2025"
+
+[defaults.score_task_exposure]
+sbatch_time = "02:00:00"
+# A per-node override of a *global* variable: this node uses a different model
+# from the rest of the pipeline.
+llm_model = "dummy-llm-large"
+llm_max_new_tokens = 4096
+system_prompt = "score_task_exposure/main/system"
+user_prompt = "score_task_exposure/main/user"
+
+[defaults.score_task_exposure_bt]
+sbatch_time = "02:00:00"
+llm_model = "dummy-llm-mini"
+llm_max_new_tokens = 256
+llm_batch_size = 10000
+n_rounds = 3
+comparisons_per_item_r1 = 5
+comparisons_per_item_r2 = 4
+comparisons_per_item_r3 = 3
+system_prompt = "score_task_exposure/pairwise/system"
+user_prompt = "score_task_exposure/pairwise/user"
+
+# ---------------
+#   Smoke tests
+# ---------------
+
+[runs.test_local]
+sample_n = 10
+embedding_model = "dummy-embed-small"
+llm_model = "dummy-llm-tiny"
+
+[runs.test_local.rerank_candidates]
+rerank_model = "dummy-reranker-tiny"
+
+[runs.test_api]
+sample_n = 10
+embedding_model = "dummy-embed-api"
+llm_model = "dummy-llm-api"
+
+[runs.test_api.rerank_candidates]
+rerank_model = "dummy-reranker-api"
+
+# ---------------
+#   Calibration
+# ---------------
+
+[runs.calibration]
+sample_n = 1000
+sbatch_cache = false
+
+[runs.calibration.llm_filter_candidates]
+sbatch_time = "04:00:00"
+filter_resume = false
+
+[runs.calibration.embed_onet]
+sbatch_time = "00:30:00"
+
+[runs.calibration.embed_ads]
+sbatch_time = "00:30:00"
+
+[runs.calibration.rerank_candidates]
+sbatch_time = "00:30:00"
+
+[runs.calibration.score_task_exposure]
+sbatch_time = "00:30:00"
+
+# ----------------
+#   Validation
+# ----------------
+
+[runs.validation_5k]
+sample_n = 5000
+sample_seed = 42
+sbatch_cache = true
+
+[runs.validation_5k.llm_filter_candidates]
+sbatch_time = "04:00:00"
+filter_resume = true
+
+[runs.validation_5k.embed_ads]
+sbatch_time = "02:00:00"
+
+[runs.validation_5k.rerank_candidates]
+sbatch_time = "08:00:00"
+
+[runs.validation_50k]
+sample_n = 50000
+sample_seed = 42
+sbatch_cache = true
+duckdb_memory_limit = "16GB"
+
+[runs.validation_50k.llm_filter_candidates]
+sbatch_time = "24:00:00"
+filter_resume = true
+
+[runs.validation_50k.embed_ads]
+sbatch_time = "08:00:00"
+
+[runs.validation_50k.rerank_candidates]
+sbatch_time = "24:00:00"
+
+# ---------------
+#   Production
+# ---------------
+
+[runs.production_5m]
+sample_n = 5000000
+sample_seed = 42
+embedding_model = "dummy-embed-large"
+llm_model = "dummy-llm-27b"
+duckdb_memory_limit = "64GB"
+
+[runs.production_5m.rerank_candidates]
+rerank_model = "dummy-reranker-large"
+chunk_size = 500
+
+[runs.production_5m.llm_filter_candidates]
+sbatch_time = "48:00:00"
+filter_resume = true
