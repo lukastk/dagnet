@@ -122,3 +122,42 @@ is implementable (worth adding; DESIGN §8 only mentions re-execution via `dagne
    in that mode. Needs a decision on warn-vs-error.
 4. Compiled node wrappers need a synthetic `__signature__`.
 5. `asset = false` is safe to build as designed — no resume-granularity penalty.
+
+---
+
+## (f) Artifact outputs and variables-as-run-config — `spike_f_artifacts_and_config.py`
+
+Two mechanics DESIGN §8 names but doesn't pin down, both confirmed:
+
+1. **An artifact-bound output declares `AssetOut(dagster_type=Nothing)` and yields
+   `Output(None, name)`.** The node wrote the artifact itself, so nothing crosses
+   the IO manager — and the asset is *still* materialized (`openfda/drug_ndc`
+   appeared in the materialization events), so it keeps its catalog entry and
+   history. Its declared location rides along as asset metadata.
+2. **A consumer takes `deps=[<artifact asset key>]`** for ordering and receives the
+   resolved `Path` from dagnet, not from Dagster.
+3. **Per-node `config_schema` plus a `ConfigurableResource` both reach the body**
+   (`sample_n=42` from `ops.load.config`, `run_name='test_api'` from the resource),
+   and a required config field left unset **fails loudly at launch** with a
+   Dagster error naming the missing entry — no silent None. That is what makes
+   `is_required=True` for a variable with no declared default the right choice.
+
+## (g) Graph-backed assets, built programmatically — `spike_g_graph_backed.py`
+
+For the `asset = false` partitioner. Three findings:
+
+1. Ops built by calling `dg.op(...)` as a function, wired inside a `dg.graph(...)`
+   body that is a closure over a topological order, work — same synthetic
+   `__signature__` requirement as multi-assets.
+2. **`AssetsDefinition.from_graph` has no `deps=` parameter.** Ordering-only
+   dependencies must therefore arrive as `Nothing`-typed *graph inputs* mapped to
+   the upstream asset key via `keys_by_input_name`. And a `Nothing` input must
+   **not** appear as a parameter of the op function — Dagster rejects it
+   explicitly ("no data will be passed for it") — it is declared in `ins` and
+   supplied only when the op is invoked inside the graph.
+3. A multi-output op invoked in a graph body unpacks as a tuple in declaration
+   order.
+
+Steps come out as `sink_graph.op_double`, `sink_graph.op_split`, `sink_graph.sink`
+— separate steps nested one level, exactly as §5.5 describes, and spike (e)
+already proved re-execution reaches them individually.
