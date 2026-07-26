@@ -22,7 +22,7 @@ This is Tier 1 (+ a thin slice of Tier 2) from the earlier "do we even need a wr
 
 Two production pipelines were examined in detail. They sit at opposite ends of netrun usage, which makes them a good joint requirements base.
 
-### 2a. Scuttlebug healthcare (box `20260531_55mxq1`, `netrun-pipeline/`)
+### 2a. Scuttlebug healthcare (the Scuttlebug pipeline repo, `netrun-pipeline/`)
 
 A 38-node batch ETL: extract from ChEMBL/CMS/OpenFDA → transform → load into DuckDB → emit a versioned bundle. Findings (detailed in its own pad):
 
@@ -398,7 +398,7 @@ Home: its own small repo/box from the start (it has two target consumers immedia
 - [P] Manifest format: **TOML and JSON**, one schema — decided 2026-07-26.
 - [P] Schema library: **msgspec** — decided 2026-07-26.
 - [+] Name: leaning **dagnet** (free on PyPI as of 2026-07-26; `plat` is taken) — confirm and create the box/repo.
-- [P] Compile target: **assets by default, plus per-node `asset = false` for transient intermediates, both from the beginning** — decided 2026-07-26. Assets give pull semantics (`--select "+key"` = `run_to_targets`), re-execution-from-failure + per-output materialization history, asset checks, and the lineage/catalog UI; `asset = false` nodes compile to ops folded into the graphs backing their downstream assets, while the manifest stays a flat graph (§5.5). Built staged inside build-plan step 1: all-assets path first, then the partitioner. (Full pros/cons and mechanics: thread `ti34`.)
+- [P] Compile target: **assets by default, plus per-node `asset = false` for transient intermediates, both from the beginning** — decided 2026-07-26. Assets give pull semantics (`--select "+key"` = `run_to_targets`), re-execution-from-failure + per-output materialization history, asset checks, and the lineage/catalog UI; `asset = false` nodes compile to ops folded into the graphs backing their downstream assets, while the manifest stays a flat graph (§5.5). Built staged inside build-plan step 1: all-assets path first, then the partitioner. (Full pros/cons and mechanics: the design discussion.)
 - [P] Scuttlebug sequencing: **build the wrapper first, then port Scuttlebug onto it** — decided 2026-07-26 (supersedes the plain-Dagster-first option mentioned in the Scuttlebug pad).
 - [P] Dagster state location: `dagster_home` in `[pipeline]`, resolved **relative to the manifest file**, default `.dagster/` next to it — decided 2026-07-26 (§5.1).
 - [P] Ephemeral CI mode: **include `--ephemeral`** — decided 2026-07-26. Trivial: a stateless in-memory instance is Dagster's native default when no `DAGSTER_HOME` is set. Caveat: pool limits may not be enforced in that mode (spike item (a)).
