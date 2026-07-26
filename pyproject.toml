@@ -16,6 +16,7 @@ dagnet = "dagnet.cli:main"
 
 [dependency-groups]
 dev = [
+    "duckdb>=1.5.4",
     "pytest>=8",
     "ruff>=0.6",
 ]
@@ -29,3 +30,11 @@ packages = ["src/dagnet"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+# netrun's dict-shaped return annotation (`-> {'rows': list[int]}`) puts string
+# literals in annotation position, and ruff reads a string in an annotation as a
+# forward reference to a type — so every output name reads as an undefined name.
+# The annotation is part of dagnet's node contract (DESIGN §7 rule 2), so this is
+# an unavoidable interaction, not sample sloppiness; consumer repos hit it too.
+"sample_projects/*/src/*/nodes.py" = ["F821"]

@@ -1,0 +1,16 @@
+[project]
+name = "checks-pipeline"
+version = "0.1.0"
+description = "dagnet sample 07: asset checks."
+requires-python = ">=3.11"
+dependencies = ["dagnet"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/checks_pipeline"]
+
+[tool.uv.sources]
+dagnet = { path = "../..", editable = true }

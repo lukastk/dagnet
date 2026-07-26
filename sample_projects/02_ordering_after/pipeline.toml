@@ -1,0 +1,36 @@
+[pipeline]
+name = "ordering_after"
+description = "Ordering-only dependencies: `after`, with no data on the edge."
+
+[nodes.reset_workspace]
+fn = "ordering_pipeline.nodes.reset_workspace"
+description = "Clears the scratch directory. Nothing consumes its value."
+outputs = ["ready"]
+
+# All three fetchers wait for the reset, and none of them takes its value.
+# In netrun this needed a `broadcast` factory node fanning a
+# `__signal_epoch_finished__` port out to three `__control_start_epoch__` ports.
+
+[nodes.fetch_users]
+fn = "ordering_pipeline.nodes.fetch_users"
+after = ["reset_workspace"]
+outputs = ["count"]
+
+[nodes.fetch_orders]
+fn = "ordering_pipeline.nodes.fetch_orders"
+after = ["reset_workspace"]
+outputs = ["count"]
+
+[nodes.fetch_events]
+fn = "ordering_pipeline.nodes.fetch_events"
+after = ["reset_workspace"]
+outputs = ["count"]
+
+# A node can mix both kinds of dependency: it needs one value, and must also
+# come after two nodes whose values it does not want.
+
+[nodes.publish]
+fn = "ordering_pipeline.nodes.publish"
+inputs = { users = "fetch_users.count" }
+after = ["fetch_orders", "fetch_events"]
+outputs = ["manifest"]

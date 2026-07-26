@@ -8,3 +8,6 @@ dist/
 *.egg-info/
 # The root uv.lock is committed; the samples' are churn (they pin dagnet by path).
 sample_projects/*/uv.lock
+sample_projects/*/build/
+sample_projects/*/src/*/_scratch/
+sample_projects/*/src/*/_attempts.txt

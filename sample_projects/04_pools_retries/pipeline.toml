@@ -1,0 +1,52 @@
+[pipeline]
+name = "pools_retries"
+description = "Named concurrency limits, and per-node retries for flaky steps."
+
+# A pool is a *limit*, not a worker pool. Parallelism comes from the executor;
+# the pool only caps how many of its members may run at once.
+[pools]
+main = 4
+heavy = 1     # serializes the GPU/LLM-shaped nodes
+
+[vars]
+flaky_attempts_needed = { type = "int", default = 3 }
+
+[nodes.prepare]
+fn = "pools_pipeline.nodes.prepare"
+outputs = ["batches"]
+pool = "main"
+
+# Three nodes in the `heavy` pool. They are independent and the executor would
+# happily run all three at once — the pool limit is what serializes them.
+
+[nodes.embed_a]
+fn = "pools_pipeline.nodes.embed"
+inputs = { batches = "prepare.batches" }
+outputs = ["window"]
+pool = "heavy"
+
+[nodes.embed_b]
+fn = "pools_pipeline.nodes.embed"
+inputs = { batches = "prepare.batches" }
+outputs = ["window"]
+pool = "heavy"
+
+[nodes.embed_c]
+fn = "pools_pipeline.nodes.embed"
+inputs = { batches = "prepare.batches" }
+outputs = ["window"]
+pool = "heavy"
+
+# A flaky external call, guarded by retries rather than by a wrapper script.
+[nodes.call_api]
+fn = "pools_pipeline.nodes.call_api"
+inputs = { batches = "prepare.batches" }
+outputs = ["payload"]
+pool = "main"
+retries = { max = 3, wait_s = 0.5 }
+
+[nodes.collect]
+fn = "pools_pipeline.nodes.collect"
+inputs = { a = "embed_a.window", b = "embed_b.window", c = "embed_c.window", payload = "call_api.payload" }
+outputs = ["report"]
+pool = "main"

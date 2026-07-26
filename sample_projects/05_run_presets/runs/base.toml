@@ -1,0 +1,22 @@
+# `[defaults]` applies to every run. Scalar keys set global variables; a subtable
+# named after a node sets that node's variables.
+[defaults]
+sample_n = 1000
+llm_model = "qwen-0.5b"
+
+[defaults.classify]
+chunk_size = 256
+
+[runs.test_api]
+sample_n = 10
+llm_model = "gpt-5.2"
+
+[runs.validation_5k]
+sample_n = 5000
+
+[runs.production]
+sample_n = 1000000
+llm_model = "gemma-27b"
+
+[runs.production.classify]
+chunk_size = 2048

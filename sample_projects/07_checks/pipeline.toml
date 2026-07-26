@@ -1,0 +1,24 @@
+[pipeline]
+name = "checks"
+description = "Asset checks guarding a schema contract at an artifact boundary."
+
+[vars]
+# Flip this to make the producer violate the contract on purpose.
+inject_bad_units = { type = "bool", default = false }
+
+[nodes.extract_measurements]
+fn = "checks_pipeline.nodes.extract_measurements"
+outputs = ["measurements"]
+# Checks are declared per output and run after it materializes. Each names an
+# import path to a plain function.
+checks = { measurements = [
+    "checks_pipeline.checks.units_are_canonical",
+    "checks_pipeline.checks.no_missing_values",
+    "checks_pipeline.checks.rows_within_expected_range",
+] }
+
+[nodes.aggregate]
+fn = "checks_pipeline.nodes.aggregate"
+inputs = { measurements = "extract_measurements.measurements" }
+outputs = ["by_analyte"]
+checks = { by_analyte = ["checks_pipeline.checks.totals_are_positive"] }

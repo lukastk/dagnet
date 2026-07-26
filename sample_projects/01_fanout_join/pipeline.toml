@@ -1,0 +1,39 @@
+[pipeline]
+name = "fanout_join"
+description = "One output feeding several nodes, and one node joining several outputs."
+
+[nodes.load_sales]
+fn = "fanout_pipeline.nodes.load_sales"
+description = "The single source every downstream node reads."
+outputs = ["records"]
+
+# Three consumers of the same output. netrun forbade one output port feeding
+# several edges and needed an explicit `broadcast` factory node; here fan-out is
+# just three inputs naming the same reference.
+
+[nodes.by_region]
+fn = "fanout_pipeline.nodes.by_region"
+inputs = { records = "load_sales.records" }
+outputs = ["totals"]
+group = "aggregate"
+
+[nodes.by_month]
+fn = "fanout_pipeline.nodes.by_month"
+inputs = { records = "load_sales.records" }
+outputs = ["totals"]
+group = "aggregate"
+
+[nodes.top_products]
+fn = "fanout_pipeline.nodes.top_products"
+inputs = { records = "load_sales.records" }
+outputs = ["ranking"]
+group = "aggregate"
+
+# A join is just a node with several inputs. No `join` factory node either.
+
+[nodes.build_report]
+fn = "fanout_pipeline.nodes.build_report"
+description = "Joins three upstream outputs; two of them are both called 'totals'."
+inputs = { regions = "by_region.totals", months = "by_month.totals", products = "top_products.ranking" }
+outputs = ["report"]
+group = "report"

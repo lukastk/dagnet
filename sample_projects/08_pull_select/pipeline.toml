@@ -1,0 +1,34 @@
+[pipeline]
+name = "pull_select"
+description = "Asking for one asset and getting everything it needs."
+
+[nodes.raw]
+fn = "select_pipeline.nodes.raw"
+outputs = ["events"]
+group = "ingest"
+
+[nodes.clean]
+fn = "select_pipeline.nodes.clean"
+inputs = { events = "raw.events" }
+outputs = ["events"]
+group = "ingest"
+
+# Two independent branches off `clean`. Selecting one leaves the other alone.
+
+[nodes.metrics]
+fn = "select_pipeline.nodes.metrics"
+inputs = { events = "clean.events" }
+outputs = ["daily"]
+group = "analysis"
+
+[nodes.sessions]
+fn = "select_pipeline.nodes.sessions"
+inputs = { events = "clean.events" }
+outputs = ["table"]
+group = "analysis"
+
+[nodes.bundle]
+fn = "select_pipeline.nodes.bundle"
+inputs = { daily = "metrics.daily", sessions = "sessions.table" }
+outputs = ["release"]
+group = "publish"

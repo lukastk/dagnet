@@ -1,0 +1,56 @@
+[pipeline]
+name = "artifacts"
+description = "Durable objects with declared locations: files and DuckDB tables."
+
+# This section replaces a hand-maintained paths.py. Every location is stated once,
+# here, and both the producing node and any consuming node resolve it through the
+# manifest via ctx.artifact(). File paths resolve relative to the manifest.
+[artifacts]
+
+# The database file itself is an artifact, so its location is declared too. No
+# node lists it as an input — it is resolved directly with ctx.artifact().
+"db/warehouse" = { kind = "file", path = "build/warehouse.duckdb" }
+
+"raw/customers" = { kind = "file", path = "build/raw/customers.json" }
+"raw/orders" = { kind = "file", path = "build/raw/orders.json" }
+
+"db/customers" = { kind = "duckdb_table", table = "customers" }
+"db/orders" = { kind = "duckdb_table", table = "orders" }
+
+[nodes.extract_customers]
+fn = "artifacts_pipeline.nodes.extract_customers"
+outputs = ["customers"]
+# This output IS that durable artifact: the node writes it, nothing is returned.
+artifacts = { customers = "raw/customers" }
+group = "extract"
+
+[nodes.extract_orders]
+fn = "artifacts_pipeline.nodes.extract_orders"
+outputs = ["orders"]
+artifacts = { orders = "raw/orders" }
+group = "extract"
+
+[nodes.load_customers]
+fn = "artifacts_pipeline.nodes.load_customers"
+# An artifact input: the function receives the resolved Path, and the dependency
+# on whichever node writes it is inferred.
+inputs = { source = "raw/customers" }
+outputs = ["customers"]
+artifacts = { customers = "db/customers" }
+group = "load"
+
+[nodes.load_orders]
+fn = "artifacts_pipeline.nodes.load_orders"
+inputs = { source = "raw/orders" }
+outputs = ["orders"]
+artifacts = { orders = "db/orders" }
+group = "load"
+# Both loaders write the same DuckDB file, so they must not run concurrently.
+after = ["load_customers"]
+
+[nodes.report]
+fn = "artifacts_pipeline.nodes.report"
+# Consuming a table artifact: the function receives the table *name*.
+inputs = { customers = "db/customers", orders = "db/orders" }
+outputs = ["summary"]
+group = "report"

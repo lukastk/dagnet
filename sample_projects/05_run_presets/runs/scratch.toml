@@ -1,0 +1,10 @@
+# A second file in the same folder. Every *.toml/*.json in `runs/` is loaded and
+# merged into one registry; a duplicate run name across files is a loud error.
+[runs.smoke]
+sample_n = 2
+llm_model = "qwen-0.5b"
+dry_run = true
+
+[runs.smoke.classify]
+sample_n = 2
+chunk_size = 1

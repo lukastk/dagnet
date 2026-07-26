@@ -1,0 +1,6 @@
+[runs.good]
+inject_bad_units = false
+
+[runs.bad]
+# Same pipeline, same code — a deliberate contract violation, so the check fails.
+inject_bad_units = true

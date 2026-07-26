@@ -1,0 +1,30 @@
+[pipeline]
+name = "run_presets"
+description = "Named run configurations: the composable parameterization system."
+
+# Every variable a node may read via ctx.vars is declared. A variable with no
+# default must be set by every run; one with a default may be left alone.
+[vars]
+sample_n = { type = "int", default = 1000, description = "Rows to process." }
+llm_model = { type = "str", description = "No default: every run must name one." }
+dry_run = { type = "bool", default = false }
+
+[nodes.sample]
+fn = "presets_pipeline.nodes.sample"
+outputs = ["rows"]
+
+[nodes.classify]
+fn = "presets_pipeline.nodes.classify"
+inputs = { rows = "sample.rows" }
+outputs = ["labels"]
+
+# A node-local declaration. It is visible only to this node, and shadows a
+# global of the same name for this node alone.
+[nodes.classify.vars]
+chunk_size = { type = "int", default = 512 }
+sample_n = { type = "int", default = 50 }
+
+[nodes.report]
+fn = "presets_pipeline.nodes.report"
+inputs = { labels = "classify.labels" }
+outputs = ["summary"]
