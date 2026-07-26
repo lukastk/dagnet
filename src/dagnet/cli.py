@@ -99,7 +99,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         # is a resume and of which run, and neither is knowable without the
         # instance. Opening it and reading run history materializes nothing.
         options = _reexecution_options(args, instance)
-        if result.manifest.pipeline.pre_run and _pre_run_refuses(
+        pipeline = result.manifest.pipeline
+        if (pipeline.pre_run or pipeline.pre_execute) and _hooks_refuse(
             args, result, manifest_path, runs_paths, options
         ):
             return EXIT_FAILED
@@ -132,11 +133,18 @@ def cmd_dev(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     _report_warnings(result)
 
-    if result.manifest.pipeline.pre_run:
+    declared = [
+        f"{len(paths)} [pipeline].{field} hook(s)"
+        for field, paths in (
+            ("pre_run", result.manifest.pipeline.pre_run),
+            ("pre_execute", result.manifest.pipeline.pre_execute),
+        )
+        if paths
+    ]
+    if declared:
         print(
             "dagnet: warning: runs launched from the Dagster UI do NOT pass through "
-            f"dagnet, so the {len(result.manifest.pipeline.pre_run)} [pipeline].pre_run "
-            "hook(s) will not run for them",
+            f"dagnet, so {' and '.join(declared)} will not run for them",
             file=sys.stderr,
         )
 
@@ -214,21 +222,22 @@ def _report_warnings(result: CheckResult) -> None:
         print(diagnostic.render(), file=sys.stderr)
 
 
-def _pre_run_refuses(
+def _hooks_refuse(
     args: argparse.Namespace,
     result: CheckResult,
     manifest_path: Path,
     runs_paths: list[Path],
     reexecution: Any,
 ) -> bool:
-    """Run the `pre_run` hooks. True means: do not launch.
+    """Run both hook kinds in order. True means: do not launch.
 
-    An ERROR from any hook aborts; WARNINGs print and the run proceeds. This is
-    dagnet's launch path only — a run started from the Dagster UI's launchpad
-    never passes through here (DESIGN §8).
+    `pre_run` validates and must fully pass before `pre_execute` — which is where
+    side effects live — gets to run at all. Nothing has executed by the time
+    either returns. This is dagnet's launch path only: a run started from the
+    Dagster UI's launchpad never passes through here (DESIGN §8).
     """
     from dagnet.compile import build_job, run_config
-    from dagnet.prerun import PreRunContext, run_hooks
+    from dagnet.prerun import PreRunContext, run_hooks, run_setup_hooks
 
     job = build_job(
         str(manifest_path),
@@ -250,10 +259,19 @@ def _pre_run_refuses(
         parent_run_id=reexecution.parent_run_id if reexecution is not None else None,
     )
 
-    diagnostics = run_hooks(result.manifest.pipeline.pre_run, context)
+    pipeline = result.manifest.pipeline
+    diagnostics = run_hooks(pipeline.pre_run, context)
     if diagnostics.items:
         print(diagnostics.render(), file=sys.stderr)
-    return bool(diagnostics.errors)
+    if diagnostics.errors:
+        return True
+
+    # The gate is fully passed; the launch is committed. Only now do the hooks
+    # that are allowed to change things get to run.
+    setup = run_setup_hooks(pipeline.pre_execute, context)
+    if setup.items:
+        print(setup.render(), file=sys.stderr)
+    return bool(setup.errors)
 
 
 def _nodes_for(result: CheckResult, asset_keys: list[str]) -> list[str]:

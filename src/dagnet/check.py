@@ -651,15 +651,20 @@ def _check_return_annotation(
 
 
 def _check_pre_run_hooks(manifest: Manifest, root: Location, diags: Diagnostics) -> None:
-    """`[pipeline] pre_run` paths must import, so a launch never fails on a typo."""
-    for index, path in enumerate(manifest.pipeline.pre_run):
-        result = import_entry_point(path)
-        if isinstance(result, ImportFailure):
-            diags.error(
-                f"pre-run-{_IMPORT_CODES[result.problem]}",
-                f"pre_run hook: {result.detail}",
-                root.child("pipeline", "pre_run").child(index),
-            )
+    """Hook paths must import, so a launch never fails on a typo."""
+    declared = (
+        ("pre_run", manifest.pipeline.pre_run, "pre-run"),
+        ("pre_execute", manifest.pipeline.pre_execute, "pre-execute"),
+    )
+    for section, paths, code_prefix in declared:
+        for index, path in enumerate(paths):
+            result = import_entry_point(path)
+            if isinstance(result, ImportFailure):
+                diags.error(
+                    f"{code_prefix}-{_IMPORT_CODES[result.problem]}",
+                    f"{section} hook: {result.detail}",
+                    root.child("pipeline", section).child(index),
+                )
 
 
 def _check_wired_annotations(

@@ -105,10 +105,43 @@ exactly like the narrow selection a guard exists to refuse. A guard that ignores
 the flag will refuse every legitimate resume; and anything that clears state
 before writing must not clear it again for steps that already succeeded.
 
+### `pre_execute` — the side-effecting slot
+
+`pre_run` validates. Once it has fully passed, the launch is committed, and
+`[pipeline] pre_execute` is where run-level *setup* goes — clearing tables,
+staging a directory, taking a lock:
+
+```toml
+[pipeline]
+pre_run     = ["warehouse.guards:no_partial_rebuild"]
+pre_execute = ["warehouse.setup:clear_target_tables"]
+```
+
+Same callable shape, same context object. The difference is side effects, and
+everything else follows from it:
+
+| | `pre_run` | `pre_execute` |
+|---|---|---|
+| purpose | validate; refuse a bad launch | set up; the launch is committed |
+| side effects | **must not** have any | this is the slot for them |
+| when | first, before anything | only after every `pre_run` hook passed |
+| on failure | all hooks still run, then abort | stops at the first failure |
+| a refused launch | reaches them | **never** reaches them |
+
+`pre_run` runs all its hooks even after one objects, so you see every objection
+at once — which is only safe because they change nothing. `pre_execute` cannot
+work that way: running the next side effect on top of a half-applied one is worse
+than an incomplete report, so it stops at the first failure. Either way, a failure
+aborts before a single step executes.
+
+Both kinds run on `--from-failure` resumes, with `is_resume` set. Whether to act
+on a resume is the hook's decision — a table-clearer generally should not, since
+the rows it would clear include ones a completed step already wrote.
+
 > **Scope: this covers `dagnet run` — not the Dagster UI.** A run launched from the
-> launchpad never passes through dagnet, so `pre_run` hooks do not run for it.
-> `dagnet dev` warns about this when a manifest declares hooks. Treat `pre_run` as
-> a guarantee about the CLI, not about the pipeline.
+> launchpad never passes through dagnet, so neither `pre_run` nor `pre_execute`
+> hooks run for it. `dagnet dev` warns about this when a manifest declares either.
+> Treat both as a guarantee about the CLI, not about the pipeline.
 
 ## Status
 

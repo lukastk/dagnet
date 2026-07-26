@@ -57,8 +57,13 @@ class Pipeline(Base):
     #: merge. Absent here and on the node means no retry.
     retries: Retries | None = None
     #: Validation hooks run before any materialization, as `module.path:callable`
-    #: (DESIGN §8). Empty means no hooks and no behaviour change.
+    #: (DESIGN §8). Side-effect-free: all of them run even after one objects, so
+    #: they must be safe to run on a launch that is about to be refused.
     pre_run: list[str] = []
+    #: Setup hooks run once the launch is committed — after every `pre_run` hook
+    #: has passed, still before any step executes (DESIGN §8). This is the slot
+    #: for side effects; they run in declared order and stop at the first failure.
+    pre_execute: list[str] = []
 
 
 class VarDecl(Base):

@@ -115,6 +115,34 @@ MODULE = '''
 
     def return_junk(context):
         return "probably fine"
+
+    SETUP = Path(__file__).with_suffix(".setup")
+
+    def _setup(name):
+        with SETUP.open("a") as handle:
+            handle.write(name + "\\n")
+
+    def clear_tables(context):
+        """The shape dagnet-db's table-clearer takes."""
+        _setup(f"clear:{context.is_resume}")
+        return Diagnostics()
+
+    def second_setup(context):
+        _setup("second")
+        return None
+
+    def failing_setup(context):
+        _setup("failing")
+        raise RuntimeError("could not reach the warehouse")
+
+    def refusing_setup(context):
+        _setup("refusing")
+        diagnostics = Diagnostics()
+        diagnostics.error(
+            "setup-failed", "the warehouse is read-only",
+            context.location("pipeline.pre_execute"),
+        )
+        return diagnostics
 '''
 
 RUNS = """
@@ -377,3 +405,102 @@ def test_a_hook_naming_a_missing_attribute_is_a_check_error(project):
     written = project(PIPELINE, module=MODULE, pipeline='pre_run = ["MOD:no_such_hook"]')
     result = check(written.manifest_path)
     assert result.diagnostics.codes() == ["pre-run-missing-attribute"]
+
+
+# --- pre_execute: the side-effecting slot ----------------------------------
+
+
+@pytest.fixture
+def staged(project):
+    """A chain with `pre_run` and/or `pre_execute` hooks declared."""
+
+    def _staged(*, gates: tuple[str, ...] = (), setups: tuple[str, ...] = ()):
+        lines = []
+        if gates:
+            lines.append("pre_run = [" + ", ".join(f'"MOD:{h}"' for h in gates) + "]")
+        if setups:
+            lines.append("pre_execute = [" + ", ".join(f'"MOD:{h}"' for h in setups) + "]")
+        return project(PIPELINE, module=MODULE, pipeline="\n".join(lines))
+
+    return _staged
+
+
+def setups_that_ran(written) -> list[str]:
+    path = written.root / f"{written.module}.setup"
+    return path.read_text().split() if path.exists() else []
+
+
+def test_pre_execute_runs_before_any_step(staged):
+    written = staged(setups=("clear_tables",))
+    assert launch(written) == EXIT_OK
+    assert setups_that_ran(written) == ["clear:False"]
+    assert steps_that_ran(written) == ["raw", "clean", "report"]
+
+
+def test_pre_execute_runs_only_after_the_gate_fully_passes(staged):
+    """A refused launch must never reach the side-effecting slot."""
+    written = staged(gates=("refuse",), setups=("clear_tables",))
+    assert launch(written) == EXIT_FAILED
+    assert setups_that_ran(written) == [], "a refused launch must not clear anything"
+    assert steps_that_ran(written) == []
+
+
+def test_a_warning_from_the_gate_still_lets_setup_run(staged):
+    written = staged(gates=("grumble",), setups=("clear_tables",))
+    assert launch(written) == EXIT_OK
+    assert setups_that_ran(written) == ["clear:False"]
+
+
+def test_a_failing_setup_hook_aborts_before_any_step(staged):
+    written = staged(setups=("failing_setup",))
+    assert launch(written) == EXIT_FAILED
+    assert steps_that_ran(written) == [], "nothing may execute after setup fails"
+
+
+def test_a_setup_hook_returning_errors_aborts_before_any_step(staged, capsys):
+    written = staged(setups=("refusing_setup",))
+    assert launch(written) == EXIT_FAILED
+    assert steps_that_ran(written) == []
+    assert "error[setup-failed]" in capsys.readouterr().err
+
+
+def test_setup_hooks_run_in_declared_order_and_stop_at_the_first_failure(staged):
+    """Unlike `pre_run`, these change things: no running the next one on top of
+    a half-applied one."""
+    written = staged(setups=("clear_tables", "failing_setup", "second_setup"))
+    assert launch(written) == EXIT_FAILED
+    assert setups_that_ran(written) == ["clear:False", "failing"]
+    assert "second" not in setups_that_ran(written)
+
+
+def test_setup_hooks_all_run_when_none_fail(staged):
+    written = staged(setups=("clear_tables", "second_setup"))
+    assert launch(written) == EXIT_OK
+    assert setups_that_ran(written) == ["clear:False", "second"]
+
+
+def test_pre_execute_is_told_whether_this_is_a_resume(flaky_pipeline, project):
+    """Acting differently on a resume is the hook's decision, so it must be told."""
+    written = project(
+        PIPELINE.replace('fn = "MOD.report"', 'fn = "MOD.flaky"'),
+        module=MODULE,
+        pipeline='pre_execute = ["MOD:clear_tables"]',
+    )
+    assert launch(written, ephemeral=False) == EXIT_FAILED
+    assert setups_that_ran(written) == ["clear:False"]
+
+    assert launch(written, "--from-failure", "last", ephemeral=False) == EXIT_OK
+    assert setups_that_ran(written) == ["clear:False", "clear:True"]
+
+
+def test_a_setup_hook_that_does_not_import_is_a_check_error(project):
+    written = project(PIPELINE, module=MODULE, pipeline='pre_execute = ["nope.mod:setup"]')
+    result = check(written.manifest_path)
+    assert result.diagnostics.codes() == ["pre-execute-not-importable"]
+    assert result.diagnostics.errors[0].location.path == "pipeline.pre_execute[0]"
+
+
+def test_declaring_only_setup_hooks_needs_no_gate(staged):
+    written = staged(setups=("clear_tables",))
+    assert launch(written, ephemeral=False) == EXIT_OK
+    assert setups_that_ran(written) == ["clear:False"]

@@ -365,7 +365,20 @@ Pool *limits* are instance state, not definition state: `pool = "heavy"` on a no
 
 The point is *refusal before work starts*: an advisory command only protects the person who thinks to run it, and the failure mode being guarded against is precisely the person who doesn't.
 
-**The scope is dagnet's own launch paths, and that is a real limit.** A run launched from the Dagster UI's launchpad **bypasses `pre_run` entirely**, because that launch never passes through dagnet — Dagster loads the `Definitions` and executes them directly. `dagnet dev` prints a warning saying so when a manifest declares hooks. Do not describe `pre_run` as a guarantee about a pipeline; it is a guarantee about the CLI.
+**Run-committed setup: `[pipeline] pre_execute`.** A second hook kind, same callable shape and the same context object, distinguished from `pre_run` on exactly one axis — **side effects** — with everything else following from that. `pre_execute` hooks run *after* every `pre_run` hook has passed with zero errors (a refused launch never reaches them) and after the selection is resolved, but still strictly before any step executes. This is the "the launch is committed, do run-level setup" moment: clearing tables, staging a directory, taking a lock.
+
+| | `pre_run` | `pre_execute` |
+|---|---|---|
+| purpose | validate; refuse a bad launch | set up; the launch is committed |
+| side effects | **must not** have any | this is the slot for them |
+| ordering | all hooks run, then aggregate | declared order, stop at first failure |
+| a refused launch | reaches them | never reaches them |
+
+The contract distinction is load-bearing in both directions. `pre_run` may aggregate — running every hook even after one objects, so a person sees all objections in one pass — *only because* those hooks change nothing and several will run on a launch that is already doomed. `pre_execute` may not aggregate for the same reason reversed: running the next side effect on top of a half-applied one is worse than an incomplete report. A `pre_execute` failure (raised, or returned ERROR diagnostics) aborts the run before any step, exit 1, same output.
+
+Both kinds run on `--from-failure` resumes with `is_resume`/`parent_run_id` set; whether to act on a resume is the hook's decision, and for anything that clears state the answer is usually no, since what it would clear includes rows a completed step already wrote.
+
+**The scope is dagnet's own launch paths, and that is a real limit.** A run launched from the Dagster UI's launchpad **bypasses both hook kinds entirely**, because that launch never passes through dagnet — Dagster loads the `Definitions` and executes them directly. `dagnet dev` prints a warning saying so when a manifest declares either. Do not describe them as a guarantee about a pipeline; they are a guarantee about the CLI.
 
 The run-preset name is **optional**: `dagnet run` with no preset uses the declared defaults, so a project with no runs file works. `ctx.run_name` is `""` in that case *(decided 2026-07-27)*.
 
@@ -438,6 +451,7 @@ Building `sample_projects/09_ai_index` — a topologically faithful replica of t
 
 - [P] **`ctx.node_name` and `ctx.manifest_path`** (§7 rule 3): two read-only properties on the node context. A helper called from inside a node body needs to know which node is calling it and where the map is; the manifest is a pipeline's discovery root, so exposing its path is aligned with the rest of the design, and resolving anything cwd-relative would be fragile — a multiprocess step runs in its own process. `manifest_path` is absolute, resolved once at compile time. Pure additions: no semantic change, nothing existing altered, no version-scheme change.
 - [P] **`[pipeline] pre_run` validation hooks** (§8): a generic seam for refusing a launch before any materialization, needed by dagnet-db's partial-rebuild guard. Hooks are import paths in the map, receive the resolved launch, and return a `Diagnostics` or raise; ERROR aborts, WARNING proceeds. Empty or absent means no behaviour change.
+- [P] **`[pipeline] pre_execute` setup hooks** (§8) — added 2026-07-27, ruling on dagnet-db's "who clears the tables" question. The answer is a *second hook kind*, not a widening of `pre_run`: the two differ on side effects, and the aggregate-vs-stop-at-first-failure behaviour follows from that difference rather than being an independent choice. Clearing tables belongs on the committed side of the gate, so a refused launch never destroys anything.
   - **Scope is CLI-only, stated rather than papered over.** UI launchpad runs bypass it.
   - [P] **`is_resume` / `parent_run_id` on the hook context** — added 2026-07-27, before dagnet-db bound to the API rather than after. A resume's effective step set is a subset of the selection, so without the flag a partial-rebuild guard refuses every legitimate resume, and clear-before-write semantics would destroy a completed co-writer's rows on resume.
   - [D] **Considered and deferred: an in-graph guard step** — compiling a validation op upstream of everything, so a UI launch would hit it too. It would close the gap, but it puts a dagnet-owned step inside the user's asset graph, it would show in the catalog and the run timeline as if it were part of the pipeline, and its failure mode (a run that starts, then fails at step one) is worse than a launch that never starts. Not built. Revisit only if UI-launched runs turn out to be a real path for a pipeline that needs guarding.

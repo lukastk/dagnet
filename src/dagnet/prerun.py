@@ -1,19 +1,38 @@
-"""`[pipeline] pre_run` — validation hooks that run before any materialization.
+"""Hooks that run before any materialization: `pre_run` and `pre_execute`.
 
-A hook is a plain callable named in the map like everything else
-(`module.path:callable`). It receives a `PreRunContext` describing the launch
-about to happen and either returns a `Diagnostics` or raises. Any ERROR-severity
-diagnostic aborts the launch with the same aggregated, located output `dagnet
-check` produces; WARNING severity prints and the run proceeds.
+Both are plain callables named in the map like everything else
+(`module.path:callable`) and both receive the same `PreRunContext` describing the
+launch about to happen. They differ on exactly one axis — **side effects** — and
+everything else about them follows from that:
 
-The point is refusal *before* work starts — an advisory command a careful person
-remembers to run is no protection against the person who doesn't think to run it.
+| | `pre_run` | `pre_execute` |
+|---|---|---|
+| purpose | validate; refuse a bad launch | set up; the launch is committed |
+| side effects | **must not** have any | this is the slot for them |
+| when | first, before anything | after every `pre_run` hook passed |
+| on failure | all hooks still run, then abort | stop at the first failure |
+| a refused launch | reaches them | never reaches them |
 
-**Scope, stated plainly:** hooks run on dagnet's own launch paths — `dagnet run`,
-with or without `--select`, and `--from-failure`. A run launched from the Dagster
-UI's launchpad **bypasses them entirely**, because that launch never passes
-through dagnet. Covering the UI too would mean compiling a guard step into the
-graph upstream of everything; that was considered and deferred (DESIGN §12).
+`pre_run` aggregates because a person should see every objection in one pass, and
+that is only safe because those hooks change nothing — several of them will run
+on a launch that is already doomed. `pre_execute` cannot aggregate for the same
+reason reversed: running the next side effect on top of a half-applied one is
+worse than an incomplete report.
+
+Either kind returns a `Diagnostics` or raises. Any ERROR-severity diagnostic
+aborts before a single step executes, with the same located output `dagnet check`
+produces; WARNING prints and the run proceeds.
+
+The point of `pre_run` is refusal *before* work starts — an advisory command a
+careful person remembers to run is no protection against the person who doesn't
+think to run it.
+
+**Scope, stated plainly:** both kinds run on dagnet's own launch paths —
+`dagnet run`, with or without `--select`, and `--from-failure`. A run launched
+from the Dagster UI's launchpad **bypasses them entirely**, because that launch
+never passes through dagnet. Covering the UI too would mean compiling a hook step
+into the graph upstream of everything; that was considered and deferred
+(DESIGN §12).
 """
 
 from __future__ import annotations
@@ -88,12 +107,14 @@ def load_hooks(paths: list[str]) -> list[tuple[str, Callable[..., Any]]]:
 
 
 def run_hooks(paths: list[str], context: PreRunContext) -> Diagnostics:
-    """Run every declared hook and collect what they all say.
+    """Run every declared `pre_run` hook and collect what they all say.
 
     Every hook runs even if an earlier one objected: the point of aggregated
-    diagnostics is that a person sees all of it in one pass. A hook that raises
-    becomes an ERROR diagnostic naming the hook, so one broken hook cannot let a
-    launch through and the output stays uniform.
+    diagnostics is that a person sees all of it in one pass. That is only safe
+    because `pre_run` hooks are required to be side-effect-free — several of them
+    will run on a launch that is already doomed. A hook that raises becomes an
+    ERROR diagnostic naming the hook, so one broken hook cannot let a launch
+    through and the output stays uniform.
     """
     diagnostics = Diagnostics()
     for path, hook in load_hooks(paths):
@@ -108,6 +129,33 @@ def run_hooks(paths: list[str], context: PreRunContext) -> Diagnostics:
             )
             continue
         diagnostics.extend(_as_diagnostics(path, returned, context))
+    return diagnostics
+
+
+def run_setup_hooks(paths: list[str], context: PreRunContext) -> Diagnostics:
+    """Run the `pre_execute` hooks: side effects, once the launch is committed.
+
+    Deliberately *not* aggregated. These hooks change things — dagnet-db clears
+    tables here — so they run in declared order and stop at the first failure.
+    Carrying on past a hook that failed would mean running the next side effect
+    on top of a half-applied one, and reporting a tidy list of everything that
+    went wrong is worth much less than not making the mess.
+    """
+    diagnostics = Diagnostics()
+    for path, hook in load_hooks(paths):
+        try:
+            returned = hook(context)
+        except Exception as exc:
+            diagnostics.error(
+                "pre-execute-failed",
+                f"pre_execute hook '{path}' failed: {exc}",
+                context.location("pipeline.pre_execute"),
+                hint=f"raised {type(exc).__name__}",
+            )
+            return diagnostics
+        diagnostics.extend(_as_diagnostics(path, returned, context))
+        if diagnostics.errors:
+            return diagnostics
     return diagnostics
 
 
