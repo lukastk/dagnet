@@ -49,7 +49,9 @@ dagnet graph                          # Mermaid, for a README
 
 **v0 is built** — the manifest and runs schema, `dagnet check`, the compiler to Dagster
 `Definitions` (both the all-assets path and the `asset = false` partitioner), and the
-`check` / `run` / `dev` / `graph` CLI. Nine sample projects run end to end.
+`check` / `run` / `dev` / `graph` CLI. Ten sample projects run end to end, the last of
+which ([`09_ai_index`](sample_projects/09_ai_index)) is a structurally faithful,
+stub-bodied replica of a real 16-node production pipeline.
 
 The design questions v0 raised have all been decided and folded into
 [`_dev/DESIGN.md`](_dev/DESIGN.md); the record of what was asked and answered is
@@ -81,7 +83,7 @@ about Dagster's behaviour is in [`_dev/experiments/FINDINGS.md`](_dev/experiment
   - `compile.py` — the mapping to Dagster `Definitions`
   - `context.py` — `ctx`, the whole surface a node function sees
   - `runs.py`, `instance.py`, `mermaid.py`, `cli.py`, `_reconstruct.py`
-- `sample_projects/` — nine self-contained sample pipelines; the de-facto spec and test corpus
+- `sample_projects/` — ten self-contained sample pipelines; the de-facto spec and test corpus
 - `tests/` — unit tests (`uv run pytest`)
 - `_dev/` — design docs, spike findings, open questions
 
