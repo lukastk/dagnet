@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from dagnet import __version__
 from dagnet.check import CheckResult, check
@@ -84,14 +85,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # Before anything is launched: build the job here in the parent so the
-    # selection can be resolved to concrete keys, then let `[pipeline] pre_run`
-    # hooks refuse the launch. Nothing has materialized at this point.
-    if result.manifest.pipeline.pre_run and _pre_run_refuses(
-        args, result, manifest_path, runs_paths
-    ):
-        return EXIT_FAILED
-
     job = reconstructable_job(
         manifest=str(manifest_path),
         runs=[str(p) for p in runs_paths],
@@ -102,6 +95,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     with open_instance(home) as instance:
+        # Resolve the resume target first: a `pre_run` hook is told whether this
+        # is a resume and of which run, and neither is knowable without the
+        # instance. Opening it and reading run history materializes nothing.
+        options = _reexecution_options(args, instance)
+        if result.manifest.pipeline.pre_run and _pre_run_refuses(
+            args, result, manifest_path, runs_paths, options
+        ):
+            return EXIT_FAILED
+
         if result.manifest.pools and not args.ephemeral:
             if not sync_pools(instance, result.manifest.pools):
                 print(
@@ -116,7 +118,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"per run rather than per step",
                     file=sys.stderr,
                 )
-        options = _reexecution_options(args, instance)
         with dg.execute_job(
             job, instance=instance, reexecution_options=options, raise_on_error=False
         ) as outcome:
@@ -218,6 +219,7 @@ def _pre_run_refuses(
     result: CheckResult,
     manifest_path: Path,
     runs_paths: list[Path],
+    reexecution: Any,
 ) -> bool:
     """Run the `pre_run` hooks. True means: do not launch.
 
@@ -244,6 +246,8 @@ def _pre_run_refuses(
         node_names=tuple(_nodes_for(result, asset_keys)),
         asset_keys=tuple(asset_keys),
         run_config=run_config(result.manifest, result, args.run_name),
+        is_resume=reexecution is not None,
+        parent_run_id=reexecution.parent_run_id if reexecution is not None else None,
     )
 
     diagnostics = run_hooks(result.manifest.pipeline.pre_run, context)

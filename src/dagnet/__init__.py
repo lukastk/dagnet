@@ -8,9 +8,11 @@ __version__ = "0.0.1"
 
 from dagnet.check import CheckResult, check
 from dagnet.compile import build, build_job
-from dagnet.context import NodeContext
+from dagnet.context import NodeContext, resolve_artifacts
 from dagnet.diagnostics import CheckFailed, DagnetError, Diagnostic, Diagnostics, Severity
 from dagnet.loader import RunRegistry, load_manifest, load_runs
+from dagnet.locations import store_root
+from dagnet.prerun import PreRunContext
 
 __all__ = [
     "CheckFailed",
@@ -19,6 +21,7 @@ __all__ = [
     "Diagnostic",
     "Diagnostics",
     "NodeContext",
+    "PreRunContext",
     "RunRegistry",
     "Severity",
     "__version__",
@@ -27,4 +30,6 @@ __all__ = [
     "check",
     "load_manifest",
     "load_runs",
+    "resolve_artifacts",
+    "store_root",
 ]

@@ -51,13 +51,23 @@ class PreRunContext:
     asset_keys: tuple[str, ...] = ()
     #: The resolved Dagster run config: variables per node, plus the run name.
     run_config: Mapping[str, Any] = field(default_factory=dict)
+    #: True when this launch is a `--from-failure` resume rather than a fresh run.
+    #: A resume re-executes a *subset* of the selection below — the steps that
+    #: failed and what depends on them — so a guard that would refuse a narrow
+    #: selection must not refuse a legitimate resume, and anything that clears
+    #: state before writing must not clear it again for steps that already
+    #: succeeded.
+    is_resume: bool = False
+    #: The run being resumed, when `is_resume`. None otherwise.
+    parent_run_id: str | None = None
 
     @property
     def is_everything(self) -> bool:
         """True when no `--select` was given, i.e. the whole pipeline is in scope.
 
         Note this describes the *selection*, not the set of steps that will end up
-        executing: `--from-failure` re-executes a subset of the same selection.
+        executing: a resume re-executes a subset of it. Check `is_resume` before
+        concluding anything about what will actually run.
         """
         return self.selection is None
 

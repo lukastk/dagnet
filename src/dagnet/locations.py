@@ -32,4 +32,11 @@ def dagster_home(manifest: Manifest, manifest_path: Path, override: str | None =
 
 
 def store_root(manifest: Manifest, manifest_path: Path, override: str | None = None) -> Path:
+    """Where file artifacts resolve, per `[pipeline] store_root` (DESIGN §5.1).
+
+    **Public API** (exported from `dagnet`), for the same reason as
+    `resolve_artifacts`: it is half of the answer to "where does this pipeline
+    keep its things", and a consumer that recomputed it would be maintaining a
+    second copy of a rule that lives in the manifest.
+    """
     return resolve_declared_path(manifest.pipeline.store_root, manifest_path, override)

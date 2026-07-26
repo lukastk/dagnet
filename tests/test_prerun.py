@@ -13,7 +13,7 @@ import json
 import pytest
 
 from dagnet.check import check
-from dagnet.cli import EXIT_FAILED, EXIT_OK, main
+from dagnet.cli import EXIT_FAILED, EXIT_OK, EXIT_USAGE, main
 
 PIPELINE = """
     [nodes.raw]
@@ -56,6 +56,15 @@ MODULE = '''
         _note("report")
         return {"summary": len(rows)}
 
+    FLAKY = Path(__file__).with_suffix(".flaky")
+
+    def flaky(ctx, rows):
+        _note("flaky")
+        if not FLAKY.exists():
+            FLAKY.write_text("failed once")
+            raise RuntimeError("first attempt fails")
+        return {"summary": len(rows)}
+
     def record(context):
         """A hook that only observes."""
         SAW.write_text(json.dumps({
@@ -66,6 +75,8 @@ MODULE = '''
             "node_names": list(context.node_names),
             "asset_keys": list(context.asset_keys),
             "run_config_nodes": sorted(context.run_config.get("ops", {})),
+            "is_resume": context.is_resume,
+            "parent_run_id": context.parent_run_id,
         }))
         return Diagnostics()
 
@@ -84,6 +95,16 @@ MODULE = '''
             "wide-selection", "this run touches everything",
             context.location("pipeline.pre_run"),
         )
+        return diagnostics
+
+    def refuse_on_resume(context):
+        """The shape a real guard takes: resume is not the same as a fresh run."""
+        diagnostics = Diagnostics()
+        if context.is_resume:
+            diagnostics.error(
+                "no-resume", f"refusing to resume {context.parent_run_id}",
+                context.location("pipeline.pre_run"),
+            )
         return diagnostics
 
     def explode(context):
@@ -119,6 +140,21 @@ def hooked(project):
         )
 
     return _hooked
+
+
+@pytest.fixture
+def flaky_pipeline(project):
+    """Like `hooked`, but the last node fails on its first attempt."""
+
+    def _flaky(*hooks: str):
+        listed = ", ".join(f'"MOD:{hook}"' for hook in hooks)
+        return project(
+            PIPELINE.replace('fn = "MOD.report"', 'fn = "MOD.flaky"'),
+            module=MODULE,
+            pipeline=f"pre_run = [{listed}]",
+        )
+
+    return _flaky
 
 
 def launch(written, *argv, ephemeral: bool = True):
@@ -177,11 +213,58 @@ def test_a_single_asset_selection_narrows_to_one_node(hooked):
     assert saw(written)["asset_keys"] == ["clean/rows"]
 
 
-def test_the_from_failure_path_is_gated_too(hooked):
-    """The hook must run before the resume machinery, not after."""
-    written = hooked("refuse")
-    assert launch(written, "--from-failure", "last") == EXIT_FAILED
-    assert steps_that_ran(written) == []
+def test_the_from_failure_path_is_gated_and_can_refuse_only_resumes(flaky_pipeline):
+    """A hook can allow the first run and refuse the resume — the whole point of
+    `is_resume`. The refused resume must not re-run a single step."""
+    written = flaky_pipeline("refuse_on_resume")
+    assert launch(written, ephemeral=False) == EXIT_FAILED  # fails at `flaky`
+    after_first = steps_that_ran(written)
+    assert after_first.count("flaky") == 1
+
+    assert launch(written, "--from-failure", "last", ephemeral=False) == EXIT_FAILED
+    assert steps_that_ran(written) == after_first, "a refused resume must re-run nothing"
+
+
+def test_resuming_with_nothing_to_resume_is_a_usage_error(hooked):
+    """The resume target is resolved before the hooks, so this is caught first —
+    'no previous run' is a more useful message than anything a hook could say."""
+    written = hooked("record")
+    assert launch(written, "--from-failure", "last") == EXIT_USAGE
+
+
+def test_a_plain_run_is_not_a_resume(hooked):
+    written = hooked("record")
+    assert launch(written) == EXIT_OK
+    assert saw(written)["is_resume"] is False
+    assert saw(written)["parent_run_id"] is None
+
+
+def test_a_select_run_is_not_a_resume(hooked):
+    written = hooked("record")
+    assert launch(written, "--select", "+clean/rows") == EXIT_OK
+    assert saw(written)["is_resume"] is False
+    assert saw(written)["parent_run_id"] is None
+
+
+def test_a_resume_says_so_and_names_the_run_it_resumes(flaky_pipeline):
+    """A resume re-executes a subset of the selection, so a guard must be able
+    to tell it apart from a deliberately narrow fresh run."""
+    import dagster as dg
+
+    written = flaky_pipeline("record")
+    # First launch fails at `flaky`, leaving a failed run to resume from.
+    assert launch(written, ephemeral=False) == EXIT_FAILED
+    first = saw(written)
+    assert first["is_resume"] is False
+
+    home = written.root / ".dagster"
+    with dg.DagsterInstance.from_config(str(home)) as instance:
+        failed_run_id = instance.get_runs(limit=1)[0].run_id
+
+    assert launch(written, "--from-failure", "last", ephemeral=False) == EXIT_OK
+    resumed = saw(written)
+    assert resumed["is_resume"] is True
+    assert resumed["parent_run_id"] == failed_run_id
 
 
 def test_the_run_preset_name_and_resolved_config_reach_the_hook(hooked):

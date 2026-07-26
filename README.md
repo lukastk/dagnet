@@ -40,7 +40,7 @@ async def main(ctx, ad_ids: list[int]) -> {'ranked': list[int]}:
 
 ```bash
 dagnet check                          # every problem at once, each with a location
-dagnet run production --select "+db/drugs"
+dagnet run production --select "*db/drugs"   # that asset and its whole upstream chain
 dagnet dev                            # the Dagster UI, run history, re-execution
 dagnet graph                          # Mermaid, for a README
 ```
@@ -92,10 +92,18 @@ def no_partial_rebuild(context):
 The hook is told `manifest_path`, `run_name`, `selection` (the `--select`
 expression, or `None` meaning everything — `is_everything` reads better),
 `node_names` and `asset_keys` (the selection resolved against the real graph),
-and `run_config`. It returns a `Diagnostics`, or `None` if it has nothing to say,
-or raises. **Any error aborts the launch** with the usual aggregated output and a
-nonzero exit; warnings print and the run proceeds. Every hook runs even after one
+`run_config`, and `is_resume` / `parent_run_id`. It returns a `Diagnostics`, or
+`None` if it has nothing to say, or raises.
+
+**Any error aborts the launch** with the usual aggregated output and a nonzero
+exit; warnings print and the run proceeds. Every hook runs even after one
 objects, so you see all the objections at once.
+
+**Check `is_resume`.** A `--from-failure` resume re-executes a *subset* of the
+selection — the steps that failed and what depends on them — so it presents
+exactly like the narrow selection a guard exists to refuse. A guard that ignores
+the flag will refuse every legitimate resume; and anything that clears state
+before writing must not clear it again for steps that already succeeded.
 
 > **Scope: this covers `dagnet run` — not the Dagster UI.** A run launched from the
 > launchpad never passes through dagnet, so `pre_run` hooks do not run for it.
@@ -121,7 +129,7 @@ about Dagster's behaviour is in [`_dev/experiments/FINDINGS.md`](_dev/experiment
 |---|---|
 | `dagnet check` | validate the manifest and run presets; reports **all** problems at once, each pointing at its manifest location |
 | `dagnet run [preset]` | materialize the pipeline under the multiprocess executor |
-| `dagnet run --select "+key"` | pull semantics: that asset and everything upstream |
+| `dagnet run --select "*key"` | pull semantics: that asset and its whole upstream chain (`+key` is one layer up, `++key` two) |
 | `dagnet run --from-failure last` | resume a failed run, skipping the steps that succeeded |
 | `dagnet run --ephemeral` | no instance state left behind (in-process; pool limits are inert) |
 | `dagnet dev` | generate `defs.py` and serve the Dagster UI |

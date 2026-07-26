@@ -42,6 +42,12 @@ class UnknownArtifact(DagnetError):
 def resolve_artifacts(manifest: Manifest, store_root: Path) -> dict[str, ArtifactLocation]:
     """Resolve every declared artifact to the location its nodes read or write.
 
+    **Public API** (exported from `dagnet`), because `dagnet-db` needs artifact
+    locations to answer questions like "which database files does this pipeline
+    use?". Re-deriving that resolution in another package would recreate the
+    shadow path registry `[artifacts]` exists to abolish — the same knowledge in
+    two places, drifting. Better an explicit dependency than a second copy.
+
     Files resolve first, because a table artifact's `database` names one of them.
     A `database` that doesn't resolve is a `check` error, so by the time this runs
     the reference is known good.
