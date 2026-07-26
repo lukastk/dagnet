@@ -2,42 +2,21 @@
 
 from __future__ import annotations
 
-import itertools
-import textwrap
-
 import pytest
 
 from dagnet.check import check
 
-HEADER = '[pipeline]\nname = "p"\n\n'
 
-#: Module names must be unique across the whole session: `sys.modules` outlives
-#: any one test's tmp_path, so a reused name would import the previous file.
-_MODULE_IDS = itertools.count()
+@pytest.fixture(name="project")
+def checked_project(project):
+    """Write a throwaway project and return its `check` result."""
 
-
-@pytest.fixture
-def project(tmp_path, monkeypatch):
-    """Write a manifest (+ optional node module and runs file) and check it."""
-    monkeypatch.syspath_prepend(str(tmp_path))
-    counter = {"n": 0}
-
-    def _project(manifest: str, module: str | None = None, runs: str | None = None, **kwargs):
-        counter["n"] += 1
-        name = f"nodes_{next(_MODULE_IDS)}"
-        if module is not None:
-            (tmp_path / f"{name}.py").write_text(textwrap.dedent(module))
-        manifest_path = tmp_path / f"pipeline_{counter['n']}.toml"
-        manifest_path.write_text(HEADER + textwrap.dedent(manifest).replace("MOD", name))
-        runs_paths = []
-        if runs is not None:
-            runs_path = tmp_path / f"runs_{counter['n']}.toml"
-            runs_path.write_text(textwrap.dedent(runs))
-            runs_paths.append(runs_path)
+    def _check(manifest: str, module: str | None = None, runs: str | None = None, **kwargs):
+        written = project(manifest, module, runs)
         kwargs.setdefault("import_functions", module is not None)
-        return check(manifest_path, runs_paths, **kwargs)
+        return check(written.manifest_path, written.runs_paths, **kwargs)
 
-    return _project
+    return _check
 
 
 # --- the headline behaviour ------------------------------------------------

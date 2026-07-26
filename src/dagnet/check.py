@@ -22,11 +22,20 @@ The checklist, in the order the passes run:
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dagnet.diagnostics import Diagnostics, Location
-from dagnet.graph import ArtifactRef, NodeRef, PipelineGraph, RefError, asset_key, resolve_reference
+from dagnet.graph import (
+    ARTIFACT_SEPARATOR,
+    ArtifactRef,
+    NodeRef,
+    PipelineGraph,
+    RefError,
+    asset_key,
+    resolve_reference,
+)
 from dagnet.loader import RunRegistry, load_manifest
 from dagnet.nodefn import (
     ImportFailure,
@@ -86,6 +95,7 @@ def check(
     root = Location(file=Path(manifest_path))
     graph = PipelineGraph.build(manifest)
 
+    _check_names(manifest, registry, root, diags)
     _check_pools(manifest, root, diags)
     _check_outputs(manifest, root, diags)
     _check_artifact_bindings(manifest, graph, root, diags)
@@ -105,6 +115,54 @@ def check(
     return CheckResult(
         diagnostics=diags, manifest=manifest, runs=registry, graph=graph, functions=functions
     )
+
+
+# --- names ----------------------------------------------------------------
+
+#: Dagster op, output, check and job names must be plain identifiers. Catching
+#: this here means a bad name is a located diagnostic rather than a traceback out
+#: of `Definitions`.
+_DAGSTER_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _check_names(
+    manifest: Manifest, registry: RunRegistry, root: Location, diags: Diagnostics
+) -> None:
+    for node_name, node in manifest.nodes.items():
+        _require_name(node_name, "node name", root.child("nodes", node_name), diags)
+        for index, output in enumerate(node.outputs):
+            _require_name(
+                output,
+                f"output name of node '{node_name}'",
+                root.child("nodes", node_name, "outputs").child(index),
+                diags,
+            )
+
+    for key in manifest.artifacts:
+        parts = key.split(ARTIFACT_SEPARATOR)
+        loc = root.child("artifacts", key)
+        if not all(parts):
+            diags.error(
+                "invalid-name",
+                f"artifact key '{key}' has an empty path component",
+                loc,
+                hint="write it as 'namespace/name'",
+            )
+            continue
+        for part in parts:
+            _require_name(part, f"component of artifact key '{key}'", loc, diags)
+
+    for run_name, loc in registry.run_sources.items():
+        _require_name(run_name, "run name", loc, diags)
+
+
+def _require_name(name: str, what: str, loc: Location, diags: Diagnostics) -> None:
+    if not _DAGSTER_NAME.match(name):
+        diags.error(
+            "invalid-name",
+            f"{what} '{name}' is not usable: names must be letters, digits and underscores only",
+            loc,
+        )
 
 
 # --- pools ----------------------------------------------------------------
