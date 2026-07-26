@@ -77,6 +77,7 @@ MODULE = '''
             "run_config_nodes": sorted(context.run_config.get("ops", {})),
             "is_resume": context.is_resume,
             "parent_run_id": context.parent_run_id,
+            "store_root": str(context.store_root),
         }))
         return Diagnostics()
 
@@ -129,6 +130,11 @@ MODULE = '''
 
     def second_setup(context):
         _setup("second")
+        return None
+
+    def record_setup_target(context):
+        """Where a clearer would act. Must be where the run actually writes."""
+        _setup(str(context.store_root))
         return None
 
     def failing_setup(context):
@@ -504,3 +510,98 @@ def test_declaring_only_setup_hooks_needs_no_gate(staged):
     written = staged(setups=("clear_tables",))
     assert launch(written, ephemeral=False) == EXIT_OK
     assert setups_that_ran(written) == ["clear:False"]
+
+
+# --- the effective store root ----------------------------------------------
+
+
+def test_a_hook_is_told_the_manifests_store_root_by_default(project):
+    written = project(
+        PIPELINE, module=MODULE, pipeline='store_root = "build"\npre_run = ["MOD:record"]'
+    )
+    assert launch(written) == EXIT_OK
+    assert saw(written)["store_root"] == str((written.root / "build").resolve())
+
+
+def test_the_store_root_override_is_what_the_hook_sees(project, tmp_path):
+    """The bug this field exists for: without it a hook resolving durable
+    locations from the manifest would act on a different place from the one the
+    run writes to, and nothing in the manifest would reveal the difference."""
+    elsewhere = tmp_path / "elsewhere"
+    written = project(
+        PIPELINE, module=MODULE, pipeline='store_root = "build"\npre_run = ["MOD:record"]'
+    )
+    assert launch(written, "--store-root", str(elsewhere)) == EXIT_OK
+    seen = saw(written)["store_root"]
+    assert seen == str(elsewhere.resolve())
+    assert seen != str((written.root / "build").resolve())
+
+
+def test_with_no_store_root_declared_the_hook_sees_the_manifest_directory(project):
+    written = project(PIPELINE, module=MODULE, pipeline='pre_run = ["MOD:record"]')
+    assert launch(written) == EXIT_OK
+    assert saw(written)["store_root"] == str(written.root.resolve())
+
+
+def test_setup_hooks_get_the_same_effective_store_root(project, tmp_path):
+    """`pre_execute` is where a clearer runs, so it above all must be right."""
+    elsewhere = tmp_path / "elsewhere"
+    written = project(
+        PIPELINE,
+        module=MODULE,
+        pipeline='store_root = "build"\npre_execute = ["MOD:record_setup_target"]',
+    )
+    assert launch(written, "--store-root", str(elsewhere)) == EXIT_OK
+    assert setups_that_ran(written) == [str(elsewhere.resolve())]
+
+
+def test_the_store_root_is_correct_on_a_resume(project):
+    written = project(
+        PIPELINE.replace('fn = "MOD.report"', 'fn = "MOD.flaky"'),
+        module=MODULE,
+        pipeline='store_root = "build"\npre_run = ["MOD:record"]',
+    )
+    expected = str((written.root / "build").resolve())
+    assert launch(written, ephemeral=False) == EXIT_FAILED
+    assert saw(written)["store_root"] == expected
+
+    assert launch(written, "--from-failure", "last", ephemeral=False) == EXIT_OK
+    resumed = saw(written)
+    assert resumed["is_resume"] is True
+    assert resumed["store_root"] == expected
+
+
+def test_the_hook_and_the_run_agree_on_where_things_live(project, tmp_path):
+    """Not just 'the flag is echoed back': the artifact really lands there."""
+    elsewhere = tmp_path / "elsewhere"
+    written = project(
+        """
+        [artifacts."out/rows"]
+        kind = "file"
+        path = "rows.txt"
+
+        [nodes.writer]
+        fn = "MOD.writer"
+        outputs = ["rows"]
+        artifacts = { rows = "out/rows" }
+        """,
+        module="""
+        from pathlib import Path
+
+        SAW = Path(__file__).with_suffix(".saw")
+
+        def writer(ctx) -> None:
+            ctx.artifact("out/rows").write_text("written")
+
+        def record(context):
+            import json
+            SAW.write_text(json.dumps({"store_root": str(context.store_root)}))
+            return None
+        """,
+        pipeline='store_root = "build"\npre_run = ["MOD:record"]',
+    )
+    assert launch(written, "--store-root", str(elsewhere)) == EXIT_OK
+    # What the hook was told, and where the run actually wrote, are the same place.
+    assert saw(written)["store_root"] == str(elsewhere.resolve())
+    assert (elsewhere / "rows.txt").read_text() == "written"
+    assert not (written.root / "build").exists()

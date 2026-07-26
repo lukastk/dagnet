@@ -89,11 +89,24 @@ def no_partial_rebuild(context):
     return diagnostics
 ```
 
-The hook is told `manifest_path`, `run_name`, `selection` (the `--select`
-expression, or `None` meaning everything — `is_everything` reads better),
-`node_names` and `asset_keys` (the selection resolved against the real graph),
-`run_config`, and `is_resume` / `parent_run_id`. It returns a `Diagnostics`, or
-`None` if it has nothing to say, or raises.
+It returns a `Diagnostics`, or `None` if it has nothing to say, or raises. What it
+is told:
+
+| | |
+|---|---|
+| `manifest_path` | absolute path of the manifest this launch was compiled from |
+| `store_root` | the **effective** store root: the `--store-root` override if given, else `[pipeline] store_root`, else the default. Absolute. |
+| `run_name` | the run preset's name, or `None` |
+| `selection` | the `--select` expression, or `None` meaning everything — `is_everything` reads better |
+| `node_names`, `asset_keys` | that selection resolved against the real graph |
+| `run_config` | the resolved Dagster run config |
+| `is_resume`, `parent_run_id` | whether this is a `--from-failure` resume, and of what |
+
+**Use `store_root`; don't re-derive it.** A hook that resolved durable locations
+from the manifest would, under `--store-root`, act on a different place from the
+one the run writes to — and nothing in the manifest would reveal the difference.
+For a hook that deletes things, that is the difference between clearing the right
+database and the wrong one.
 
 **Any error aborts the launch** with the usual aggregated output and a nonzero
 exit; warnings print and the run proceeds. Every hook runs even after one

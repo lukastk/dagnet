@@ -237,6 +237,7 @@ def _hooks_refuse(
     Dagster UI's launchpad never passes through here (DESIGN §8).
     """
     from dagnet.compile import build_job, run_config
+    from dagnet.locations import store_root as resolve_store_root
     from dagnet.prerun import PreRunContext, run_hooks, run_setup_hooks
 
     job = build_job(
@@ -251,6 +252,9 @@ def _hooks_refuse(
     context = PreRunContext(
         manifest_path=manifest_path.resolve(),
         run_name=args.run_name,
+        # The same call the compiler makes, with the same inputs, so a hook and
+        # the run it is about to gate can never disagree about where things live.
+        store_root=resolve_store_root(result.manifest, manifest_path.resolve(), args.store_root),
         selection=args.select,
         node_names=tuple(_nodes_for(result, asset_keys)),
         asset_keys=tuple(asset_keys),

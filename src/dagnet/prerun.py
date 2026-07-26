@@ -59,6 +59,17 @@ class PreRunContext:
 
     #: Absolute path of the manifest this launch was compiled from.
     manifest_path: Path
+    #: The **effective** store root for this launch, absolute: the `--store-root`
+    #: override when one was given, otherwise `[pipeline] store_root`, otherwise
+    #: the default. Use this rather than re-deriving it from the manifest — under
+    #: `--store-root` the two differ, and a hook that resolved durable locations
+    #: itself would act on a different database from the one the run writes to,
+    #: with nothing in the manifest to reveal the discrepancy.
+    #:
+    #: Deliberately has no default: a hook must never silently receive a
+    #: plausible-looking wrong location, which is the whole failure this field
+    #: exists to close.
+    store_root: Path
     #: The run preset's name, or None when launched without one.
     run_name: str | None
     #: The `--select` expression exactly as given, or None meaning everything.
